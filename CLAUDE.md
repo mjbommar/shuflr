@@ -80,7 +80,11 @@ Two crates, not four. The library `shuflr` contains all engine modules (`shuffle
 
 ## Current status
 
-Through PR-23: Everything through PR-14 (5 shuffle modes, convert/info/index/analyze/verify, --rank/--world-size partitioning, --limit/--sample-rate inline sampling, progress bars), plus PR-15 (visible WARN on silently-dropped oversized records), PR-16 (wire standalone `verify`), PR-17 (`shuflr man` roff generator), PR-18 (default --threads=0 → physical cores), PR-19 (Jensen–Shannon + per-frame entropy in `analyze`), PR-20 (PyTorch IterableDataset example), PR-21 (`--min-entropy` / `--max-entropy` filter on convert), PR-22 (`index-perm` works directly on seekable-zstd — no plain-file scratch), and PR-23 (`.shuflr-idx-zst` sidecar persists the record table → 127 s cold becomes 0.08 s hot, 1595× speedup on the 1.2M-record EDGAR corpus). 163 tests green. Bench in `docs/bench/001-edgar-31gb-gzip.md`: peak 2.37 GB/s convert throughput at 8 threads on 8P/16T Ryzen, full 1.2M-record chunk-shuffled in 154 s at 1.19 GB/s. Known follow-ups: parallel-pread reader for convert, parallel frame-decode for `index-perm` bulk uniform shuffles on zstd, SIGBUS handler + `--require-immutable`, `serve` gRPC subcommand.
+Through PR-25. Highlights of what shipped since PR-14: PR-15 (visible WARN on silently-dropped oversized records), PR-16 (wire standalone `verify`), PR-17 (`shuflr man` roff generator), PR-18 (default --threads=0 → physical cores), PR-19 (Jensen–Shannon + per-frame entropy in `analyze`), PR-20 (PyTorch IterableDataset example), PR-21 (`--min-entropy` / `--max-entropy` filter on convert), PR-22 (`index-perm` works directly on seekable-zstd — no plain-file scratch), PR-23 (`.shuflr-idx-zst` sidecar → 127 s cold becomes 0.08 s hot, 1595× speedup on the 1.2M-record EDGAR corpus), PR-24 (`analyze --json` — machine-readable AnalysisReport for scripting), PR-25 (indicatif progress bar during the zstd record-index cold build, so users aren't staring at a blank terminal for two minutes).
+
+**167 tests green.** Bench in `docs/bench/001-edgar-31gb-gzip.md`: peak 2.37 GB/s convert throughput at 8 threads on 8P/16T Ryzen, full 1.2M-record chunk-shuffled in 154 s at 1.19 GB/s, sidecar-hot `index-perm` startup in 80 ms on the same file.
+
+Known follow-ups: parallel-pread reader for convert, parallel frame-decode for `index-perm` bulk uniform shuffles on zstd, SIGBUS handler + `--require-immutable`, `serve` gRPC subcommand (the biggest remaining piece).
 
 ## Upstream
 
