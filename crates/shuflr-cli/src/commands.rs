@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use crate::cli;
 use crate::exit;
+use crate::progress;
 
 pub fn stream(args: cli::StreamArgs) -> exit::Code {
     match stream_inner(args) {
@@ -416,6 +417,30 @@ fn run_index_perm_zstd(args: cli::StreamArgs, path: &std::path::Path) -> shuflr:
         args.epochs
     };
     let total_start = Instant::now();
+
+    // Only the first epoch pays the cold build. Wire a progress bar for
+    // that one to avoid a silent multi-minute stall on huge corpora.
+    let show_progress = progress::should_show(args.progress);
+    let build_bar: Option<std::sync::Arc<indicatif::ProgressBar>> = if show_progress {
+        match shuflr::io::zstd_seekable::SeekableReader::open(path) {
+            Ok(r) => Some(std::sync::Arc::new(progress::new_count_bar(
+                r.num_frames() as u64,
+                "indexing frames",
+                "frames",
+            ))),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let on_build_frame: Option<std::sync::Arc<dyn Fn(usize, usize) + Send + Sync>> =
+        build_bar.as_ref().map(|pb| {
+            let pb = std::sync::Arc::clone(pb);
+            std::sync::Arc::new(move |i: usize, _n: usize| {
+                pb.set_position(i as u64);
+            }) as std::sync::Arc<dyn Fn(usize, usize) + Send + Sync>
+        });
+
     for epoch in 0..epochs_cap {
         let cfg = shuflr::pipeline::IndexPermZstdConfig {
             seed,
@@ -424,6 +449,11 @@ fn run_index_perm_zstd(args: cli::StreamArgs, path: &std::path::Path) -> shuflr:
             ensure_trailing_newline: true,
             cache_capacity: shuflr::pipeline::index_perm_zstd::DEFAULT_CACHE_CAPACITY,
             partition: partition_from_args(&args),
+            on_build_frame: if epoch == 0 {
+                on_build_frame.clone()
+            } else {
+                None
+            },
         };
         let started = Instant::now();
         let (stats, metrics) = shuflr::pipeline::index_perm_zstd(path, &mut sink, &cfg)?;
@@ -450,6 +480,13 @@ fn run_index_perm_zstd(args: cli::StreamArgs, path: &std::path::Path) -> shuflr:
             && total.records_out >= cap
         {
             break;
+        }
+        // Clear the build bar after the first epoch regardless — later
+        // epochs are sidecar-hot and don't touch the build path.
+        if epoch == 0
+            && let Some(pb) = &build_bar
+        {
+            pb.finish_and_clear();
         }
     }
     let elapsed = total_start.elapsed();
@@ -1277,7 +1314,29 @@ fn index_inner_zstd(
     let started = Instant::now();
     let fingerprint = shuflr::Fingerprint::from_metadata(in_path)?;
     let mut reader = shuflr::io::zstd_seekable::SeekableReader::open(in_path)?;
-    let (idx, scanned) = shuflr::io::zstd_seekable::RecordIndex::build(&mut reader)?;
+
+    // A full-file frame scan on a multi-GB input is the motivating
+    // case for a progress bar: users shouldn't be left staring at a
+    // blank terminal for two minutes.
+    let n_frames = reader.num_frames() as u64;
+    let bar = if progress::should_show(cli::When::Auto) {
+        Some(progress::new_count_bar(
+            n_frames,
+            "indexing frames",
+            "frames",
+        ))
+    } else {
+        None
+    };
+    let (idx, scanned) =
+        shuflr::io::zstd_seekable::RecordIndex::build_with_progress(&mut reader, |i, _| {
+            if let Some(pb) = &bar {
+                pb.set_position(i as u64);
+            }
+        })?;
+    if let Some(pb) = &bar {
+        pb.finish_and_clear();
+    }
     let build_ms = started.elapsed().as_millis() as u64;
 
     let save_start = Instant::now();

@@ -30,7 +30,7 @@ use crate::seed::Seed;
 /// accesses without dominating RSS. Tune via [`Config::cache_capacity`].
 pub const DEFAULT_CACHE_CAPACITY: usize = 32;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub seed: u64,
     pub epoch: u64,
@@ -41,6 +41,24 @@ pub struct Config {
     /// Optional (rank, world_size) partition. Each rank takes every
     /// W-th index of the shuffled permutation starting at offset R.
     pub partition: Option<(u32, u32)>,
+    /// Optional callback invoked per frame during an index-build cold
+    /// path (`on_build_frame(frame_idx, n_frames)`). Used by the CLI
+    /// to drive a progress bar; library and tests leave it `None`.
+    pub on_build_frame: Option<std::sync::Arc<dyn Fn(usize, usize) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("seed", &self.seed)
+            .field("epoch", &self.epoch)
+            .field("sample", &self.sample)
+            .field("ensure_trailing_newline", &self.ensure_trailing_newline)
+            .field("cache_capacity", &self.cache_capacity)
+            .field("partition", &self.partition)
+            .field("on_build_frame", &self.on_build_frame.is_some())
+            .finish()
+    }
 }
 
 impl Default for Config {
@@ -52,6 +70,7 @@ impl Default for Config {
             ensure_trailing_newline: true,
             cache_capacity: DEFAULT_CACHE_CAPACITY,
             partition: None,
+            on_build_frame: None,
         }
     }
 }
@@ -97,14 +116,22 @@ pub fn run(path: &Path, sink: impl Write, cfg: &Config) -> Result<(Stats, RunMet
                 sidecar = %sidecar.display(),
                 "sidecar fingerprint mismatches input; rebuilding",
             );
-            let (built, scanned) = RecordIndex::build(&mut reader)?;
+            let (built, scanned) = RecordIndex::build_with_progress(&mut reader, |i, n| {
+                if let Some(cb) = &cfg.on_build_frame {
+                    cb(i, n);
+                }
+            })?;
             if let Err(e) = built.save(&sidecar, fingerprint) {
                 tracing::warn!(err = %e, "failed to persist rebuilt sidecar; continuing");
             }
             (built, scanned)
         }
         Err(_) => {
-            let (built, scanned) = RecordIndex::build(&mut reader)?;
+            let (built, scanned) = RecordIndex::build_with_progress(&mut reader, |i, n| {
+                if let Some(cb) = &cfg.on_build_frame {
+                    cb(i, n);
+                }
+            })?;
             if let Err(e) = built.save(&sidecar, fingerprint) {
                 tracing::warn!(err = %e, "failed to persist new sidecar; continuing");
             } else {

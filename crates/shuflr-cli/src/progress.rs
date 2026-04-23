@@ -60,6 +60,25 @@ pub fn new_bar(total_bytes: Option<u64>, prefix: &str) -> ProgressBar {
     }
 }
 
+/// Build a progress bar counting discrete units (frames, records, …) with
+/// a known total. Used by long-running jobs that don't have a neat "bytes
+/// consumed" number but do have a frame count — e.g. the seekable-zstd
+/// record-index cold build.
+pub fn new_count_bar(total: u64, prefix: &str, unit: &str) -> ProgressBar {
+    let pb = ProgressBar::new(total);
+    let template = format!(
+        "{{prefix:.bold}} {{bar:30.cyan/blue}} {{pos}}/{{len}} {unit} ({{per_sec}}, ETA {{eta}})"
+    );
+    pb.set_style(
+        ProgressStyle::with_template(&template)
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("=> "),
+    );
+    pb.set_prefix(prefix.to_string());
+    pb.enable_steady_tick(Duration::from_millis(120));
+    pb
+}
+
 /// Wraps a `Read` and bumps the attached progress bar on every successful read.
 pub struct ProgressReader<R: Read> {
     inner: R,

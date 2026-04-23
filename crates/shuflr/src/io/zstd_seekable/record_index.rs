@@ -69,10 +69,22 @@ impl RecordIndex {
     /// record's location. Returns the total decompressed bytes scanned,
     /// so callers can log throughput.
     pub fn build(reader: &mut SeekableReader) -> Result<(Self, u64)> {
+        Self::build_with_progress(reader, |_, _| {})
+    }
+
+    /// Like [`build`], but calls `on_frame(frame_idx, n_frames)` once per
+    /// frame *before* decoding it. The CLI wires this to an indicatif
+    /// progress bar so users aren't left staring at a blank terminal
+    /// during a multi-minute cold-cache build on huge corpora.
+    pub fn build_with_progress<F: FnMut(usize, usize)>(
+        reader: &mut SeekableReader,
+        mut on_frame: F,
+    ) -> Result<(Self, u64)> {
         let n_frames = reader.num_frames();
         let mut entries = Vec::new();
         let mut total_bytes: u64 = 0;
         for frame_id in 0..n_frames {
+            on_frame(frame_id, n_frames);
             let bytes = reader.decompress_frame(frame_id)?;
             total_bytes += bytes.len() as u64;
             let fid = u32::try_from(frame_id).map_err(|_| {
@@ -339,6 +351,38 @@ mod tests {
         for e in &idx.entries {
             assert!((e.frame_id as usize) < reader.num_frames());
             assert!(e.length > 0);
+        }
+    }
+
+    #[test]
+    fn build_with_progress_fires_once_per_frame_in_order() {
+        let records: Vec<String> = (0..200).map(|i| format!("rec_{i:03}\n")).collect();
+        let record_refs: Vec<&[u8]> = records.iter().map(|s| s.as_bytes()).collect();
+        let tf = build_fixture(&record_refs);
+
+        let mut reader = SeekableReader::open(tf.path()).unwrap();
+        let expected_frames = reader.num_frames();
+        assert!(
+            expected_frames > 1,
+            "test fixture must have multiple frames; got {expected_frames}"
+        );
+
+        let seen: std::cell::RefCell<Vec<(usize, usize)>> =
+            std::cell::RefCell::new(Vec::new());
+        let (_idx, _) = RecordIndex::build_with_progress(&mut reader, |i, n| {
+            seen.borrow_mut().push((i, n));
+        })
+        .unwrap();
+
+        let seen = seen.into_inner();
+        assert_eq!(
+            seen.len(),
+            expected_frames,
+            "callback must fire exactly once per frame",
+        );
+        for (expected_i, &(got_i, got_n)) in seen.iter().enumerate() {
+            assert_eq!(got_i, expected_i, "frames must be visited in order");
+            assert_eq!(got_n, expected_frames, "n_frames must be stable per call");
         }
     }
 
