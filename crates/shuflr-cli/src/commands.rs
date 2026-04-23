@@ -852,11 +852,134 @@ fn humanize_bytes(n: u64) -> String {
     format!("{n} B")
 }
 
-pub fn analyze(_args: cli::AnalyzeArgs) -> exit::Code {
-    stub(
-        "analyze",
-        "002 §6.4; lands after PR-3 (streaming inputs)".into(),
+pub fn analyze(args: cli::AnalyzeArgs) -> exit::Code {
+    match analyze_inner(args) {
+        Ok(verdict) => match verdict {
+            shuflr::analyze::Verdict::Safe => exit::Code::Ok,
+            shuflr::analyze::Verdict::Unsafe => exit::Code::AnalyzeUnsafe,
+        },
+        Err(e) => report_library_error(&e),
+    }
+}
+
+fn analyze_inner(args: cli::AnalyzeArgs) -> shuflr::Result<shuflr::analyze::Verdict> {
+    #[cfg(feature = "zstd")]
+    {
+        if args.input.inputs.len() != 1 {
+            return Err(shuflr::Error::Input(
+                "`shuflr analyze` accepts exactly one seekable-zstd input".into(),
+            ));
+        }
+        let path = &args.input.inputs[0];
+        if path == std::path::Path::new("-") {
+            return Err(shuflr::Error::Input(
+                "`shuflr analyze` requires a seekable file, not stdin".into(),
+            ));
+        }
+
+        // Fail politely if the input isn't a seekable zstd file.
+        let mut reader =
+            shuflr::io::zstd_seekable::SeekableReader::open(path).map_err(|e| match e {
+                shuflr::Error::Io(io) => shuflr::Error::Input(format!(
+                    "'{}' is not a seekable-zstd file ({io}). Run `shuflr convert` first.",
+                    path.display(),
+                )),
+                other => other,
+            })?;
+
+        let report = shuflr::analyze::run(
+            &mut reader,
+            args.sample_chunks as usize,
+            args.strict as u64, // deterministic but not user-exposed
+        )?;
+
+        print_report(path, &report)?;
+
+        if args.strict && report.verdict == shuflr::analyze::Verdict::Unsafe {
+            // `--strict` turns the warning into a non-zero exit so scripts
+            // can gate. The pretty-print already explained why.
+            return Ok(shuflr::analyze::Verdict::Unsafe);
+        }
+        // Without --strict, always exit Ok but the verdict in the stdout
+        // lets callers inspect.
+        Ok(if args.strict {
+            report.verdict
+        } else {
+            shuflr::analyze::Verdict::Safe
+        })
+    }
+    #[cfg(not(feature = "zstd"))]
+    {
+        Err(shuflr::Error::Input(
+            "`shuflr analyze` requires the zstd feature; rebuild with `--features zstd`".into(),
+        ))
+    }
+}
+
+#[cfg(feature = "zstd")]
+fn print_report(
+    path: &std::path::Path,
+    report: &shuflr::analyze::AnalysisReport,
+) -> shuflr::Result<()> {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "analyze:       {}", path.display()).map_err(shuflr::Error::Io)?;
+    writeln!(out, "total frames:  {}", report.total_frames).map_err(shuflr::Error::Io)?;
+    writeln!(out, "sampled:       {}", report.sampled_frames).map_err(shuflr::Error::Io)?;
+    writeln!(
+        out,
+        "records seen:  {} (mean {:.1} B/record)",
+        report.total_records_sampled, report.mean_record_len_bytes,
     )
+    .map_err(shuflr::Error::Io)?;
+    writeln!(
+        out,
+        "byte-KL max:   {:.4} nats ({})",
+        report.byte_kl_max,
+        qualify(
+            report.byte_kl_max,
+            shuflr::analyze::BYTE_KL_THRESHOLD_UNSAFE
+        )
+    )
+    .map_err(shuflr::Error::Io)?;
+    writeln!(
+        out,
+        "reclen CV:     {:.3}      ({})",
+        report.reclen_cv,
+        qualify(
+            report.reclen_cv,
+            shuflr::analyze::RECLEN_CV_THRESHOLD_UNSAFE
+        )
+    )
+    .map_err(shuflr::Error::Io)?;
+    match report.verdict {
+        shuflr::analyze::Verdict::Safe => {
+            writeln!(out, "verdict:       SAFE — chunk-shuffled is fine")
+                .map_err(shuflr::Error::Io)?;
+        }
+        shuflr::analyze::Verdict::Unsafe => {
+            writeln!(
+                out,
+                "verdict:       UNSAFE — source-order locality detected.\n\
+                 recommendation: use `shuflr index {}` + `--shuffle=index-perm`\n\
+                 for a provably uniform shuffle.",
+                path.display()
+            )
+            .map_err(shuflr::Error::Io)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "zstd")]
+fn qualify(value: f64, threshold: f64) -> &'static str {
+    if value < threshold * 0.5 {
+        "uniform"
+    } else if value < threshold {
+        "mild drift"
+    } else {
+        "SKEWED"
+    }
 }
 
 pub fn index(args: cli::IndexArgs) -> exit::Code {

@@ -5,6 +5,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod analyze;
 pub mod error;
 pub mod framing;
 pub mod index;
