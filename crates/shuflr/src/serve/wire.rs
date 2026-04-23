@@ -312,7 +312,39 @@ where
         .await;
     };
 
-    // ---- Phase 5: reply ServerHello. Always plain-batch for PR-33.
+    // ---- Phase 5: negotiate the payload mode (005 §3.5).
+    //
+    // The RawFrame compression-passthrough mode is only safe for
+    // chunk-shuffled on a seekable-zstd input. We need:
+    //   (a) the dataset is a seekable-zstd file (reader opens OK)
+    //   (b) shuffle=chunk-shuffled
+    //   (c) client advertised `capability_flags & 0b01` (understands raw-frame)
+    //   (d) no --sample, --rank/world_size (those break frame-level granularity)
+    //
+    // Otherwise we fall back to plain-batch, which works everywhere.
+    let wants_raw_frame = (client_hello.capability_flags & 0b0000_0001) != 0;
+    let seekable_ok = {
+        #[cfg(feature = "zstd")]
+        {
+            crate::io::zstd_seekable::SeekableReader::open(&entry.path).is_ok()
+        }
+        #[cfg(not(feature = "zstd"))]
+        {
+            false
+        }
+    };
+    let use_raw_frame = wants_raw_frame
+        && open.shuffle == "chunk-shuffled"
+        && open.sample.is_none()
+        && open.rank.is_none()
+        && open.world_size.is_none()
+        && seekable_ok;
+    let chosen_mode = if use_raw_frame {
+        ChosenMode::RawFrame
+    } else {
+        ChosenMode::PlainBatch
+    };
+
     let batch_records = if open.max_batch_records == 0 {
         64
     } else {
@@ -334,7 +366,7 @@ where
     let stream_opened_bytes = serde_json::to_vec(&stream_opened).unwrap_or_default();
     let hello = ServerHello {
         status: HandshakeStatus::Ok,
-        chosen_mode: Some(ChosenMode::PlainBatch),
+        chosen_mode: Some(chosen_mode),
         initial_credit: DEFAULT_INITIAL_CREDIT,
         server_version: 1,
         max_message_bytes: shuflr_wire::MAX_MESSAGE_BYTES,
@@ -345,7 +377,28 @@ where
     wr.write_all(&tx_buf).await.map_err(Error::Io)?;
     wr.flush().await.map_err(Error::Io)?;
 
-    // ---- Phase 6: run the pipeline; stream PlainBatch + EpochBoundary + StreamClosed.
+    // ---- Phase 6a: raw-frame branch. Ship compressed frames with
+    // their 32-byte per-frame ChaCha20 seed; the client decompresses
+    // and replays Fisher-Yates locally. Wire bytes ≈ on-disk bytes
+    // (~6× smaller than NDJSON on EDGAR-like corpora).
+    #[cfg(feature = "zstd")]
+    if chosen_mode == ChosenMode::RawFrame {
+        let raw_result = stream_raw_frames(
+            &entry.path,
+            open.seed,
+            0, // epoch — PR-33 only supports single-epoch runs
+            &mut wr,
+            &mut tx_buf,
+            &mut rd,
+            &mut scratch,
+            &mut decoder,
+        )
+        .await;
+        return finish_stream(raw_result, &mut wr, &mut tx_buf).await;
+    }
+
+    // ---- Phase 6b: plain-batch. Run the pipeline; stream
+    // PlainBatch + EpochBoundary + StreamClosed.
     let path = entry.path.clone();
     let partition = match (open.rank, open.world_size) {
         (Some(r), Some(w)) if w > 1 && r < w => Some((r, w)),
@@ -491,6 +544,195 @@ where
     wr.write_all(tx_buf).await.map_err(Error::Io)?;
     *batch_id += 1;
     Ok(())
+}
+
+/// Raw-frame streamer (005 §3.5). For each frame in the permuted
+/// order, pread the compressed bytes and ship them wholesale with
+/// the 32-byte per-frame ChaCha20 seed. Server CPU drops to
+/// `pread + send`; the client pays the decompress + Fisher-Yates.
+///
+/// Returns `Ok(total_records, epochs_completed)` on success.
+#[cfg(feature = "zstd")]
+#[allow(clippy::too_many_arguments)]
+async fn stream_raw_frames<W, R>(
+    path: &std::path::Path,
+    seed: u64,
+    epoch: u32,
+    wr: &mut W,
+    tx_buf: &mut Vec<u8>,
+    rd: &mut R,
+    scratch: &mut [u8],
+    decoder: &mut Decoder,
+) -> Result<(u64, u32)>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use rand::seq::SliceRandom;
+    use shuflr_wire::Message as WireMsg;
+
+    // Job: given the seekable-zstd path, figure out frame ordering
+    // and per-frame seeds ahead of time. The pread / encode loop
+    // then runs entirely async on the current task (no spawn_blocking
+    // needed — we're doing I/O, not CPU work, since we don't
+    // decompress).
+    let reader = crate::io::zstd_seekable::SeekableReader::open(path)?;
+    let n_frames = reader.num_frames();
+    // Materialize the per-frame compressed-byte offsets and lengths
+    // so we can release the reader before doing async pread.
+    let entries = reader.entries().to_vec();
+    drop(reader);
+
+    // Permuted frame order + per-frame seeds. Use the exact same
+    // derivation as the in-process chunk-shuffled pipeline so the
+    // client's replay matches byte-for-byte.
+    let seed_tree = crate::seed::Seed::new(seed);
+    let perm_key = seed_tree.perm(epoch as u64);
+    let mut perm_rng = crate::seed::Seed::rng_from(perm_key);
+    let mut frame_order: Vec<usize> = (0..n_frames).collect();
+    frame_order.shuffle(&mut perm_rng);
+
+    // Prefix sums over the on-disk compressed frame sizes give us
+    // pread offsets. (SeekableReader computes this internally; we do
+    // it here so we can own a File handle independently.)
+    let mut offsets: Vec<u64> = Vec::with_capacity(n_frames + 1);
+    let mut acc: u64 = 0;
+    for e in &entries {
+        offsets.push(acc);
+        acc += e.compressed_size as u64;
+    }
+    offsets.push(acc);
+
+    let file = tokio::fs::File::open(path).await.map_err(Error::Io)?;
+    let mut file = file;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let mut total_records: u64 = 0;
+    for &frame_id in &frame_order {
+        let off = offsets[frame_id];
+        let comp_size = entries[frame_id].compressed_size as usize;
+        file.seek(std::io::SeekFrom::Start(off))
+            .await
+            .map_err(Error::Io)?;
+        let mut comp = vec![0u8; comp_size];
+        file.read_exact(&mut comp).await.map_err(Error::Io)?;
+        // Count the records this frame carries so EpochBoundary
+        // is accurate. Decoded-size is stored in the seek table, but
+        // not the record count; do one memchr pass after decompression
+        // — that's still server-side work. For now derive it as
+        // best-effort from the decompressed size / average record
+        // length. The client's iterator exposes the exact count; we
+        // only use this for EpochBoundary bookkeeping.
+        //
+        // Cheaper compromise: count records by decompressing in a
+        // blocking task. Frame decompression on the server side
+        // *somewhat* defeats the CPU savings of raw-frame, so instead
+        // we cheat: we trust `decompressed_size` and let the client's
+        // `StreamClosed.total_records` field come from the server's
+        // guess. The server instead reports records *as the number of
+        // `\n` bytes in the decompressed frame*, which is the
+        // engine's record count. That's what `records_in_epoch`
+        // really ought to carry — so we decompress + count after
+        // all. Small price: the server pays 1 decode + 1 memchr per
+        // frame (on ~thousands of bytes each), and still saves the
+        // big record-by-record compression work.
+        let decoded_guess = tokio::task::block_in_place(|| -> Result<u64> {
+            let bytes = zstd::stream::decode_all(&comp[..]).map_err(Error::Io)?;
+            Ok(memchr::memchr_iter(b'\n', &bytes).count() as u64
+                + u64::from(!bytes.ends_with(b"\n") && !bytes.is_empty()))
+        })?;
+        total_records += decoded_guess;
+        let fid_u32 = u32::try_from(frame_id)
+            .map_err(|_| Error::Input(format!("frame_id {frame_id} exceeds u32")))?;
+        let perm_seed = seed_tree.frame(epoch as u64, frame_id as u64);
+        let msg = WireMsg::RawFrame {
+            frame_id: fid_u32,
+            perm_seed,
+            zstd_bytes: comp,
+        };
+        tx_buf.clear();
+        encode_into(&msg, tx_buf);
+        wr.write_all(tx_buf).await.map_err(Error::Io)?;
+
+        // Drain inbound control frames between writes without
+        // blocking: non-blocking read attempt.
+        drain_control_frames_nonblocking(rd, decoder, scratch)?;
+    }
+    wr.flush().await.map_err(Error::Io)?;
+
+    Ok((total_records, 1))
+}
+
+/// Try to decode already-available client control messages without
+/// blocking on more bytes. Used between raw-frame writes so we notice
+/// a client `Cancel` promptly without serializing the accept loop.
+#[cfg(feature = "zstd")]
+fn drain_control_frames_nonblocking<R>(
+    _rd: &mut R,
+    decoder: &mut Decoder,
+    _scratch: &mut [u8],
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    // Drain anything already buffered in the decoder; don't pull new
+    // bytes off the socket here (that'd require an await and defeat
+    // the point). Ignored kinds are silently dropped — PR-33a adds
+    // AddCredit handling.
+    while let Some(msg) = decoder
+        .try_next()
+        .map_err(|e| Error::Input(format!("control decode: {e}")))?
+    {
+        if matches!(msg, shuflr_wire::Message::Cancel { .. }) {
+            return Err(Error::Input("client cancelled".into()));
+        }
+    }
+    Ok(())
+}
+
+/// Send EpochBoundary + StreamClosed (or StreamError on failure).
+#[cfg(feature = "zstd")]
+async fn finish_stream<W>(
+    result: Result<(u64, u32)>,
+    wr: &mut W,
+    tx_buf: &mut Vec<u8>,
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    match result {
+        Ok((total_records, epochs_completed)) => {
+            let epoch_msg = Message::EpochBoundary {
+                completed_epoch: 0,
+                records_in_epoch: total_records,
+            };
+            tx_buf.clear();
+            encode_into(&epoch_msg, tx_buf);
+            wr.write_all(tx_buf).await.map_err(Error::Io)?;
+
+            let closed = Message::StreamClosed {
+                total_records,
+                epochs_completed,
+            };
+            tx_buf.clear();
+            encode_into(&closed, tx_buf);
+            wr.write_all(tx_buf).await.map_err(Error::Io)?;
+            wr.flush().await.map_err(Error::Io)?;
+            Ok(())
+        }
+        Err(e) => {
+            let err_msg = Message::StreamError {
+                code: StreamErrorCode::Internal,
+                fatal: true,
+                detail: e.to_string().into_bytes(),
+            };
+            tx_buf.clear();
+            encode_into(&err_msg, tx_buf);
+            let _ = wr.write_all(tx_buf).await;
+            let _ = wr.flush().await;
+            Err(e)
+        }
+    }
 }
 
 /// Send a ServerHello{status=Error} and close the write side so the

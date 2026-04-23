@@ -69,7 +69,7 @@ fn server_hello() -> impl Strategy<Value = Message> {
 }
 
 fn raw_frame() -> impl Strategy<Value = Message> {
-    (any::<u32>(), any::<u64>(), bytes_strategy(32 * 1024)).prop_map(|(fid, seed, b)| {
+    (any::<u32>(), any::<[u8; 32]>(), bytes_strategy(32 * 1024)).prop_map(|(fid, seed, b)| {
         Message::RawFrame {
             frame_id: fid,
             perm_seed: seed,

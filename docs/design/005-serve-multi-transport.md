@@ -190,7 +190,7 @@ If the server can't satisfy any mode the client understands, it replies with `st
 
 | kind | name | payload layout |
 |---|---|---|
-| 1 | `RawFrame` | `frame_id u32 \| perm_seed u64 \| zstd_bytes[...]` |
+| 1 | `RawFrame` | `frame_id u32 \| perm_seed [u8; 32] \| zstd_bytes[...]` — 32-byte ChaCha20 seed so the client can byte-identically replay the in-frame Fisher-Yates |
 | 2 | `ZstdBatch` | `batch_id u64 \| epoch u32 \| n_records u32 \| zstd_bytes[...]` (decompresses to `n_records × (len u32, bytes[len])`) |
 | 3 | `PlainBatch` | `batch_id u64 \| epoch u32 \| n_records u32 \| n_records × (len u32, bytes[len])` |
 | 4 | `EpochBoundary` | `completed_epoch u32 \| records_in_epoch u64` |

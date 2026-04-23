@@ -62,3 +62,9 @@ rcgen = "0.13"
 # over tokio TCP; the main CLI brings tokio in via --features serve.
 shuflr-wire = { path = "../shuflr-wire" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros"] }
+# Raw-frame replay in tests: decompress zstd, reseed ChaCha20, Fisher-
+# Yates — same pieces the Python client uses, checked independently
+# on the Rust side.
+memchr = "2"
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+rand_chacha = "0.3"

@@ -3466,6 +3466,8 @@ dependencies = [
  "indicatif",
  "memchr",
  "predicates",
+ "rand 0.8.6",
+ "rand_chacha 0.3.1",
  "rcgen",
  "rustls 0.23.39",
  "shuflr",
@@ -3482,7 +3484,10 @@ dependencies = [
 name = "shuflr-client"
 version = "0.0.0"
 dependencies = [
+ "memchr",
  "pyo3",
+ "rand 0.8.6",
+ "rand_chacha 0.3.1",
  "serde",
  "serde_json",
  "shuflr",
@@ -3491,6 +3496,7 @@ dependencies = [
  "thiserror 2.0.18",
  "ureq",
  "url",
+ "zstd",
 ]
 
 [[package]]

@@ -316,3 +316,79 @@ def test_wire_rejects_unknown_dataset(serve_factory, tmp_path):
     ds = shuflr_client.Dataset(f"{server['base']}/missing")
     with pytest.raises(OSError):
         list(ds)
+
+
+# ---------------- raw-frame passthrough (PR-33b) ----------------
+
+
+def _convert_to_zstd(plain_path: Path, out_path: Path) -> None:
+    """Run `shuflr convert` to produce a seekable-zstd file."""
+    bin_path = _find_shuflr_bin()
+    subprocess.run(
+        [
+            str(bin_path),
+            "convert",
+            "--log-level",
+            "warn",
+            "-o",
+            str(out_path),
+            str(plain_path),
+        ],
+        check=True,
+    )
+
+
+def test_wire_raw_frame_preserves_multiset(serve_factory, tmp_path):
+    """Raw-frame mode is selected automatically when shuffle=chunk-
+    shuffled on a seekable-zstd corpus. Server ships compressed frames;
+    client decompresses + Fisher-Yates locally. Output multiset must
+    match the input."""
+    plain = tmp_path / "c.jsonl"
+    seekable = tmp_path / "c.jsonl.zst"
+    records = [f'{{"i":{i:04d}}}' for i in range(800)]
+    plain.write_text("\n".join(records) + "\n")
+    _convert_to_zstd(plain, seekable)
+    server = serve_factory({"corpus": seekable}, transport="wire")
+
+    ds = shuflr_client.Dataset(
+        f"{server['base']}/corpus",
+        seed=42,
+        shuffle="chunk-shuffled",
+    )
+    got = [r.decode() for r in ds]
+    assert sorted(got) == sorted(records), (
+        f"multiset mismatch: got {len(got)} records"
+    )
+    # Output is shuffled (probabilistically !=). Use a sentinel
+    # record count high enough to make equal order vanishingly unlikely
+    # under a real shuffle.
+    assert got != records
+
+
+def test_wire_raw_and_plain_multiset_match(serve_factory, tmp_path):
+    """Raw-frame path (chunk-shuffled on seekable-zstd) and plain-
+    batch path (shuffle=buffer) both see the same input, so their
+    multisets must match. Order differs because the two paths derive
+    RNG streams at different points; that's fine."""
+    plain = tmp_path / "c.jsonl"
+    seekable = tmp_path / "c.jsonl.zst"
+    records = [f'r{i:04d}' for i in range(300)]
+    plain.write_text("\n".join(records) + "\n")
+    _convert_to_zstd(plain, seekable)
+    server = serve_factory({"corpus": seekable}, transport="wire")
+
+    ds_raw = shuflr_client.Dataset(
+        f"{server['base']}/corpus",
+        seed=11,
+        shuffle="chunk-shuffled",
+    )
+    raw_records = [r.decode() for r in ds_raw]
+    assert sorted(raw_records) == sorted(records)
+
+    ds_plain = shuflr_client.Dataset(
+        f"{server['base']}/corpus",
+        seed=11,
+        shuffle="buffer",
+    )
+    plain_records = [r.decode() for r in ds_plain]
+    assert sorted(plain_records) == sorted(records)

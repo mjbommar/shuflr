@@ -209,6 +209,22 @@ impl WireStream {
                 self.pending.extend(batch.records);
                 None
             }
+            Message::RawFrame {
+                frame_id,
+                perm_seed,
+                zstd_bytes,
+            } => match decompress_and_shuffle(&zstd_bytes, perm_seed) {
+                Ok(records) => {
+                    self.pending.extend(records);
+                    None
+                }
+                Err(e) => {
+                    self.exhausted = true;
+                    Some(PyIOError::new_err(format!(
+                        "raw-frame decode (frame_id={frame_id}): {e}"
+                    )))
+                }
+            },
             Message::EpochBoundary { .. } | Message::Heartbeat { .. } => None,
             Message::StreamClosed { .. } => {
                 self.exhausted = true;
@@ -565,6 +581,34 @@ fn open_wire_tcp(
         scratch,
         exhausted: false,
     })
+}
+
+/// Client-side half of the raw-frame mode (005 §3.5): take a
+/// zstd-compressed frame's bytes + the 32-byte ChaCha20 seed, decode
+/// and Fisher-Yates-shuffle the records inside, return them in shuffle
+/// order. Byte-identical to what the in-process `chunk-shuffled`
+/// pipeline emits for the same seed.
+fn decompress_and_shuffle(zstd_bytes: &[u8], perm_seed: [u8; 32]) -> Result<Vec<Vec<u8>>, String> {
+    use rand::SeedableRng;
+    use rand::seq::SliceRandom;
+
+    let bytes = zstd::stream::decode_all(zstd_bytes).map_err(|e| format!("zstd decode: {e}"))?;
+    // Split on '\n'; the engine guarantees a trailing newline on
+    // every record, so memchr gives us (start_inclusive,
+    // end_exclusive) positions cleanly.
+    let mut records: Vec<Vec<u8>> = Vec::new();
+    let mut start = 0usize;
+    for nl in memchr::memchr_iter(b'\n', &bytes) {
+        records.push(bytes[start..nl].to_vec());
+        start = nl + 1;
+    }
+    if start < bytes.len() {
+        records.push(bytes[start..].to_vec());
+    }
+
+    let mut rng = rand_chacha::ChaCha20Rng::from_seed(perm_seed);
+    records.shuffle(&mut rng);
+    Ok(records)
 }
 
 /// Python module entry point. Exposes `Dataset` to the Python side.

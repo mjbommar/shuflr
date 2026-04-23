@@ -99,7 +99,7 @@ fn write_payload(msg: &Message, out: &mut Vec<u8>) {
             zstd_bytes,
         } => {
             out.extend_from_slice(&frame_id.to_le_bytes());
-            out.extend_from_slice(&perm_seed.to_le_bytes());
+            out.extend_from_slice(perm_seed);
             out.extend_from_slice(zstd_bytes);
         }
         Message::ZstdBatch {
@@ -409,16 +409,19 @@ fn parse_server_hello(p: &[u8]) -> Result<Message, WireError> {
 }
 
 fn parse_raw_frame(p: &[u8]) -> Result<Message, WireError> {
-    if p.len() < 12 {
+    // frame_id u32 (4) + perm_seed [u8;32] (32) = 36-byte fixed header.
+    const HDR: usize = 4 + 32;
+    if p.len() < HDR {
         return Err(WireError::TruncatedPayload {
             kind: Kind::RawFrame as u8,
-            expected: 12,
+            expected: HDR,
             got: p.len(),
         });
     }
     let frame_id = u32::from_le_bytes(p[0..4].try_into().unwrap_or([0; 4]));
-    let perm_seed = u64::from_le_bytes(p[4..12].try_into().unwrap_or([0; 8]));
-    let zstd_bytes = p[12..].to_vec();
+    let mut perm_seed = [0u8; 32];
+    perm_seed.copy_from_slice(&p[4..36]);
+    let zstd_bytes = p[36..].to_vec();
     Ok(Message::RawFrame {
         frame_id,
         perm_seed,

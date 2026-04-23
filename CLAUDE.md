@@ -86,9 +86,9 @@ Through PR-28. Highlights since PR-14: PR-15 (visible WARN on silently-dropped o
 
 **179 tests green.** Both hot-path emit modes (`chunk-shuffled` and `index-perm` on seekable-zstd) now have prefetch-pipeline parallel variants. `--emit-threads=N --emit-prefetch=K` is shared across modes; default stays `--emit-threads=1` (no behavior change without opt-in).
 
-Through **PR-33**: HTTP transport with rustls TLS 1.3 + bearer/mTLS auth (PR-30/31), Python client (PR-34a, HTTP-only), `shuflr-wire/1` codec crate (PR-32), and wire transport inside `serve` speaking TCP + optional TLS with `plain-batch` mode for all 5 shuffle modes (PR-33). `shuflr serve --wire 127.0.0.1:9443 --http 127.0.0.1:9000 ...` runs both listeners simultaneously under one Ctrl-C.
+Through **PR-34b**: HTTP transport with rustls TLS 1.3 + bearer/mTLS auth (PR-30/31), `shuflr-wire/1` codec crate (PR-32), wire transport inside `serve` speaking TCP + optional TLS with `plain-batch` mode for all 5 shuffle modes (PR-33), and the Python client (`shuflr-client`) speaking both HTTP and `shuflr://` wire (PR-34a/b). `shuflr serve --wire 127.0.0.1:9443 --http 127.0.0.1:9000 ...` runs both listeners simultaneously under one Ctrl-C.
 
-Remaining 005 PRs: **33a** credit-based flow control — **33b** raw-frame passthrough for chunk-shuffled (~6× wire savings) — **33c** zstd-batch compression — **33d** UDS listener — **34b** `shuflr-client` speaks wire — **35** gRPC — **36** observability.
+Remaining 005 PRs: **33a** credit-based flow control — **33b** raw-frame passthrough for chunk-shuffled (~6× wire savings) — **33c** zstd-batch compression — **33d** UDS listener — **34c** `shuflr-client` speaks `shuflrs://` (TLS) — **35** gRPC — **36** observability.
 
 Other known follow-ups: parallel-pread reader for convert, SIGBUS handler + `--require-immutable`, consistent `--log-level` across all subcommands.
 

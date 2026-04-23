@@ -16,8 +16,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use shuflr_wire::{
-    AuthKind, ChosenMode, ClientHello, DecodeOptions, Decoder, HandshakeRole, HandshakeStatus,
-    Message, encode,
+    AuthKind, BatchPayload, ChosenMode, ClientHello, DecodeOptions, Decoder, HandshakeRole,
+    HandshakeStatus, Message, encode,
 };
 
 fn shuflr_bin() -> PathBuf {
@@ -145,6 +145,8 @@ fn fetch_records(
                             let detail = String::from_utf8_lossy(&h.stream_opened);
                             panic!("server rejected: {detail}");
                         }
+                        // fetch_records callers use plain-JSONL inputs
+                        // so RawFrame can't be selected. Pin that here.
                         assert_eq!(h.chosen_mode, Some(ChosenMode::PlainBatch));
                     }
                     Message::PlainBatch(batch) => {
@@ -349,4 +351,160 @@ fn wire_bearer_auth_rejects_wrong_token() {
         }
     });
     assert!(detail.contains("auth"), "expected auth error: {detail}");
+}
+
+// ---- PR-33b raw-frame tests ----
+
+fn convert_to_seekable_zstd(plain: &std::path::Path, out: &std::path::Path) {
+    let status = Command::new(shuflr_bin())
+        .args(["convert", "--log-level", "warn", "-o"])
+        .arg(out)
+        .arg(plain)
+        .status()
+        .unwrap();
+    assert!(status.success(), "convert failed");
+}
+
+#[test]
+fn wire_negotiates_raw_frame_on_chunk_shuffled_seekable() {
+    // When the client advertises raw-frame capability AND the dataset
+    // is seekable-zstd AND shuffle=chunk-shuffled, the server must
+    // pick ChosenMode::RawFrame.
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = tmp.path().join("c.jsonl");
+    let seekable = tmp.path().join("c.jsonl.zst");
+    let records: Vec<String> = (0..200).map(|i| format!("r{i:03}")).collect();
+    std::fs::write(&plain, records.join("\n") + "\n").unwrap();
+    convert_to_seekable_zstd(&plain, &seekable);
+    let g = spawn_wire_server(&[("corpus", &seekable)], &[]);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (chosen, collected) = rt.block_on(async move {
+        use rand::SeedableRng;
+        use rand::seq::SliceRandom;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", g.port))
+            .await
+            .unwrap();
+        let open = r#"{"dataset_id":"corpus","seed":7,"shuffle":"chunk-shuffled"}"#;
+        let hello = Message::ClientHello(ClientHello {
+            capability_flags: 0b111, // raw-frame capable
+            auth_kind: AuthKind::None,
+            auth: vec![],
+            open_stream: open.as_bytes().to_vec(),
+        });
+        s.write_all(&encode(&hello)).await.unwrap();
+
+        let mut d = Decoder::new(DecodeOptions {
+            role: HandshakeRole::ExpectServerHello,
+            ..Default::default()
+        });
+        let mut scratch = vec![0u8; 64 * 1024];
+        let mut chosen = None;
+        let mut collected: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let n = s.read(&mut scratch).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            d.feed(&scratch[..n]);
+            while let Some(msg) = d.try_next().unwrap() {
+                match msg {
+                    Message::ServerHello(h) => {
+                        assert_eq!(h.status, HandshakeStatus::Ok);
+                        chosen = h.chosen_mode;
+                    }
+                    Message::RawFrame {
+                        zstd_bytes,
+                        perm_seed,
+                        ..
+                    } => {
+                        let decoded = zstd::stream::decode_all(&zstd_bytes[..]).unwrap();
+                        let mut recs = Vec::new();
+                        let mut start = 0usize;
+                        for nl in memchr::memchr_iter(b'\n', &decoded) {
+                            recs.push(decoded[start..nl].to_vec());
+                            start = nl + 1;
+                        }
+                        if start < decoded.len() {
+                            recs.push(decoded[start..].to_vec());
+                        }
+                        let mut rng = rand_chacha::ChaCha20Rng::from_seed(perm_seed);
+                        recs.shuffle(&mut rng);
+                        collected.extend(recs);
+                    }
+                    Message::PlainBatch(BatchPayload { records, .. }) => {
+                        collected.extend(records);
+                    }
+                    Message::EpochBoundary { .. } => {}
+                    Message::StreamClosed { .. } => return (chosen, collected),
+                    Message::StreamError {
+                        code,
+                        fatal,
+                        detail,
+                    } => {
+                        panic!(
+                            "server error {code:?} fatal={fatal} detail={}",
+                            String::from_utf8_lossy(&detail)
+                        );
+                    }
+                    other => panic!("unexpected: {other:?}"),
+                }
+            }
+        }
+        (chosen, collected)
+    });
+    assert_eq!(chosen, Some(ChosenMode::RawFrame));
+    let mut got: Vec<_> = collected
+        .iter()
+        .map(|b| std::str::from_utf8(b).unwrap().to_string())
+        .collect();
+    got.sort();
+    let mut want = records;
+    want.sort();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn wire_falls_back_to_plain_batch_when_shuffle_is_not_chunk_shuffled() {
+    // Raw-frame requires shuffle=chunk-shuffled. For buffer/none/
+    // index-perm the server must stay on plain-batch.
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = tmp.path().join("c.jsonl");
+    let seekable = tmp.path().join("c.jsonl.zst");
+    std::fs::write(&plain, "a\nb\nc\nd\n").unwrap();
+    convert_to_seekable_zstd(&plain, &seekable);
+    let g = spawn_wire_server(&[("corpus", &seekable)], &[]);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let chosen = rt.block_on(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", g.port))
+            .await
+            .unwrap();
+        let open = r#"{"dataset_id":"corpus","seed":0,"shuffle":"buffer"}"#;
+        let hello = Message::ClientHello(ClientHello {
+            capability_flags: 0b111, // raw-frame capable
+            auth_kind: AuthKind::None,
+            auth: vec![],
+            open_stream: open.as_bytes().to_vec(),
+        });
+        s.write_all(&encode(&hello)).await.unwrap();
+        let mut d = Decoder::new(DecodeOptions {
+            role: HandshakeRole::ExpectServerHello,
+            ..Default::default()
+        });
+        let mut scratch = vec![0u8; 8192];
+        loop {
+            let n = s.read(&mut scratch).await.unwrap();
+            if n == 0 {
+                panic!("eof before hello");
+            }
+            d.feed(&scratch[..n]);
+            if let Some(Message::ServerHello(h)) = d.try_next().unwrap() {
+                return h.chosen_mode;
+            }
+        }
+    });
+    assert_eq!(chosen, Some(ChosenMode::PlainBatch));
 }

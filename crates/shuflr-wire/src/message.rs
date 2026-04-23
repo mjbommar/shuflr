@@ -176,7 +176,11 @@ pub enum Message {
     ServerHello(ServerHello),
     RawFrame {
         frame_id: u32,
-        perm_seed: u64,
+        /// 32-byte ChaCha20 seed the server used to Fisher-Yates the
+        /// records inside this frame. The client reseeds and replays
+        /// to produce byte-identical output to the in-process
+        /// `chunk-shuffled` pipeline.
+        perm_seed: [u8; 32],
         zstd_bytes: Vec<u8>,
     },
     ZstdBatch {
