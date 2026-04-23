@@ -45,6 +45,9 @@ pub struct Config {
     /// path (`on_build_frame(frame_idx, n_frames)`). Used by the CLI
     /// to drive a progress bar; library and tests leave it `None`.
     pub on_build_frame: Option<std::sync::Arc<dyn Fn(usize, usize) + Send + Sync>>,
+    /// Worker threads for the cold index-build. 0 = physical cores
+    /// (default), 1 = sequential fallback. Ignored on a sidecar-hit.
+    pub build_threads: usize,
 }
 
 impl std::fmt::Debug for Config {
@@ -57,6 +60,7 @@ impl std::fmt::Debug for Config {
             .field("cache_capacity", &self.cache_capacity)
             .field("partition", &self.partition)
             .field("on_build_frame", &self.on_build_frame.is_some())
+            .field("build_threads", &self.build_threads)
             .finish()
     }
 }
@@ -71,6 +75,7 @@ impl Default for Config {
             cache_capacity: DEFAULT_CACHE_CAPACITY,
             partition: None,
             on_build_frame: None,
+            build_threads: 0,
         }
     }
 }
@@ -83,6 +88,33 @@ pub struct RunMetrics {
     pub cache_misses: u64,
     pub records_scanned: u64,
     pub total_decompressed_in_build: u64,
+}
+
+/// Build the RecordIndex, using the parallel path when configured and
+/// falling back to sequential for the `--build-threads=1` case. The
+/// parallel path preserves frame-order output so both modes produce a
+/// byte-identical sidecar (tested in `build_parallel_matches_sequential`).
+fn build_index(
+    reader: &mut SeekableReader,
+    path: &Path,
+    cfg: &Config,
+) -> Result<(RecordIndex, u64)> {
+    if cfg.build_threads == 1 {
+        RecordIndex::build_with_progress(reader, |i, n| {
+            if let Some(cb) = &cfg.on_build_frame {
+                cb(i, n);
+            }
+        })
+    } else {
+        let on_frame: Box<dyn Fn(usize, usize) + Send + Sync> = match &cfg.on_build_frame {
+            Some(cb) => {
+                let cb = cb.clone();
+                Box::new(move |i, n| cb(i, n))
+            }
+            None => Box::new(|_, _| {}),
+        };
+        RecordIndex::build_parallel(path, cfg.build_threads, on_frame)
+    }
 }
 
 /// Run index-perm over a seekable-zstd input.
@@ -116,22 +148,14 @@ pub fn run(path: &Path, sink: impl Write, cfg: &Config) -> Result<(Stats, RunMet
                 sidecar = %sidecar.display(),
                 "sidecar fingerprint mismatches input; rebuilding",
             );
-            let (built, scanned) = RecordIndex::build_with_progress(&mut reader, |i, n| {
-                if let Some(cb) = &cfg.on_build_frame {
-                    cb(i, n);
-                }
-            })?;
+            let (built, scanned) = build_index(&mut reader, path, cfg)?;
             if let Err(e) = built.save(&sidecar, fingerprint) {
                 tracing::warn!(err = %e, "failed to persist rebuilt sidecar; continuing");
             }
             (built, scanned)
         }
         Err(_) => {
-            let (built, scanned) = RecordIndex::build_with_progress(&mut reader, |i, n| {
-                if let Some(cb) = &cfg.on_build_frame {
-                    cb(i, n);
-                }
-            })?;
+            let (built, scanned) = build_index(&mut reader, path, cfg)?;
             if let Err(e) = built.save(&sidecar, fingerprint) {
                 tracing::warn!(err = %e, "failed to persist new sidecar; continuing");
             } else {

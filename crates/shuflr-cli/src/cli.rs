@@ -149,6 +149,12 @@ pub struct StreamArgs {
     #[arg(long, default_value_t = 100_000, value_name = "K")]
     pub buffer_size: u64,
 
+    /// Worker threads for the --shuffle=index-perm cold sidecar build
+    /// on seekable-zstd inputs. 0 = physical cores, 1 = sequential.
+    /// Ignored once the .shuflr-idx-zst sidecar is warm.
+    #[arg(long, default_value_t = 0, value_name = "N")]
+    pub build_threads: usize,
+
     /// Number of records for --shuffle=reservoir (Vitter Algorithm R)
     #[arg(long, default_value_t = 10_000, value_name = "K")]
     pub reservoir_size: u64,
@@ -292,9 +298,14 @@ pub struct IndexArgs {
     #[command(flatten)]
     pub input: InputArgs,
 
-    /// Output index path (default: <input>.shuflr-idx)
+    /// Output index path (default: <input>.shuflr-idx[,-zst])
     #[arg(short = 'o', long, value_name = "PATH")]
     pub output: Option<PathBuf>,
+
+    /// Worker threads for the seekable-zstd record-index build. 0 =
+    /// physical cores, 1 = sequential. Ignored for plain JSONL inputs.
+    #[arg(long, default_value_t = 0, value_name = "N")]
+    pub threads: usize,
 }
 
 #[derive(Args, Debug)]

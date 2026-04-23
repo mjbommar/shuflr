@@ -454,6 +454,7 @@ fn run_index_perm_zstd(args: cli::StreamArgs, path: &std::path::Path) -> shuflr:
             } else {
                 None
             },
+            build_threads: args.build_threads,
         };
         let started = Instant::now();
         let (stats, metrics) = shuflr::pipeline::index_perm_zstd(path, &mut sink, &cfg)?;
@@ -1263,7 +1264,7 @@ fn index_inner(args: cli::IndexArgs) -> shuflr::Result<()> {
         if raw_format == shuflr::io::magic::Format::Zstd
             && shuflr::io::zstd_seekable::SeekableReader::open(in_path).is_ok()
         {
-            return index_inner_zstd(args.output.as_deref(), in_path);
+            return index_inner_zstd(args.output.as_deref(), in_path, args.threads);
         }
     }
 
@@ -1306,6 +1307,7 @@ fn index_inner(args: cli::IndexArgs) -> shuflr::Result<()> {
 fn index_inner_zstd(
     explicit_out: Option<&std::path::Path>,
     in_path: &std::path::Path,
+    threads: usize,
 ) -> shuflr::Result<()> {
     let out_path = explicit_out
         .map(std::path::Path::to_path_buf)
@@ -1313,27 +1315,37 @@ fn index_inner_zstd(
 
     let started = Instant::now();
     let fingerprint = shuflr::Fingerprint::from_metadata(in_path)?;
-    let mut reader = shuflr::io::zstd_seekable::SeekableReader::open(in_path)?;
+    let reader = shuflr::io::zstd_seekable::SeekableReader::open(in_path)?;
 
     // A full-file frame scan on a multi-GB input is the motivating
     // case for a progress bar: users shouldn't be left staring at a
     // blank terminal for two minutes.
     let n_frames = reader.num_frames() as u64;
+    drop(reader);
     let bar = if progress::should_show(cli::When::Auto) {
-        Some(progress::new_count_bar(
+        Some(std::sync::Arc::new(progress::new_count_bar(
             n_frames,
             "indexing frames",
             "frames",
-        ))
+        )))
     } else {
         None
     };
-    let (idx, scanned) =
+    let (idx, scanned) = if threads == 1 {
+        let mut reader = shuflr::io::zstd_seekable::SeekableReader::open(in_path)?;
         shuflr::io::zstd_seekable::RecordIndex::build_with_progress(&mut reader, |i, _| {
             if let Some(pb) = &bar {
                 pb.set_position(i as u64);
             }
-        })?;
+        })?
+    } else {
+        let bar_cb = bar.clone();
+        shuflr::io::zstd_seekable::RecordIndex::build_parallel(in_path, threads, move |i, _| {
+            if let Some(pb) = &bar_cb {
+                pb.set_position(i as u64);
+            }
+        })?
+    };
     if let Some(pb) = &bar {
         pb.finish_and_clear();
     }

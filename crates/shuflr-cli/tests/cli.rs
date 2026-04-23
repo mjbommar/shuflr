@@ -586,6 +586,59 @@ fn info_json_mode_parses_cleanly() {
 }
 
 #[test]
+fn index_perm_zstd_parallel_build_matches_sequential() {
+    // Same seed, same input, different --build-threads => byte-identical
+    // output. Pins the PR-26 invariant that parallelism is a pure
+    // performance optimization and never changes semantics.
+    use std::collections::BTreeSet;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = tmp.path().join("in.jsonl");
+    let seekable = tmp.path().join("in.jsonl.zst");
+    let records: Vec<String> = (0..600).map(|i| format!("{{\"i\":{i:03}}}\n")).collect();
+    std::fs::write(&plain, records.concat()).unwrap();
+
+    shuflr()
+        .args(["convert", "--log-level", "warn", "-o"])
+        .arg(&seekable)
+        .arg(&plain)
+        .assert()
+        .success();
+
+    let run = |threads: &str| {
+        std::fs::remove_file(tmp.path().join("in.jsonl.zst.shuflr-idx-zst")).ok();
+        let out = shuflr()
+            .args([
+                "stream",
+                "--shuffle",
+                "index-perm",
+                "--seed",
+                "42",
+                "--build-threads",
+                threads,
+                "--log-level",
+                "warn",
+            ])
+            .arg(&seekable)
+            .assert()
+            .success();
+        String::from_utf8(out.get_output().stdout.clone()).unwrap()
+    };
+
+    let seq = run("1");
+    let par = run("4");
+    assert_eq!(
+        seq, par,
+        "parallel build must produce byte-identical output to sequential"
+    );
+
+    // And both cover the full multiset.
+    let expected: BTreeSet<&str> = records.iter().map(|s| s.trim_end()).collect();
+    let got: BTreeSet<&str> = par.lines().collect();
+    assert_eq!(got, expected);
+}
+
+#[test]
 fn analyze_json_mode_emits_parseable_report() {
     let tmp = tempfile::tempdir().unwrap();
     let input = tmp.path().join("in.jsonl");

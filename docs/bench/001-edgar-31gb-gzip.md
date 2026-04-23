@@ -163,6 +163,34 @@ Output byte-identical across all three runs for the same `--seed`.
 
 The sidecar is **not** a security-sensitive cache: a fingerprint collision would at worst yield stale record positions that decompress-fail at runtime (not silent data corruption). We accept that risk in exchange for O(1) startup on repeat runs. Users who want to force a rebuild can delete the sidecar.
 
+### Operation #14 — parallel record-index build (PR-26)
+
+Sequential `RecordIndex::build` decodes every frame on the caller
+thread; a 28,695-frame / 1.2M-record EDGAR corpus takes 127 s. Each
+frame decode is independent, so we can fan out across a worker pool.
+`RecordIndex::build_parallel(path, threads, on_frame)` opens one file
+handle per worker, preads the frame byte range, decompresses, scans
+for `\n` boundaries, and ships `(frame_id, Vec<RecordLocation>, scanned)`
+back on a crossbeam channel. The driver collects out-of-order, then
+flattens slots in ascending `frame_id` — output is byte-identical to
+the sequential path (verified by both the
+`build_parallel_matches_sequential` unit test and a real-corpus diff).
+
+Measured on `tmp/edgar-0.05.jsonl.zst` (30.92 GB seekable-zstd,
+1,199,612 records, 28,695 frames):
+
+| Mode | `--build-threads` | Wall | User | Max RSS | Speedup |
+|---|---|---|---|---|---|
+| Sequential (PR-23/25) | 1 | **133.09 s** | 77.38 s | 536 MiB | 1.00× |
+| Parallel (PR-26, default) | 0 → 8 phys cores | **32.23 s** | 142.70 s | 1.72 GiB | **4.13×** |
+
+Cache-hot path is unchanged (0.08 s, 55 MiB RSS). RSS grows to ~1.7 GiB
+during the parallel build because each worker independently buffers
+its in-flight frame (~2 MiB median, up to ~427 MiB for the largest
+single-record frame). Users who care more about RSS than wall time can
+pin `--build-threads=1`. Otherwise the default is now 8× phys-cores,
+matching the convert path's default from PR-18.
+
 ## Open follow-ups (updated)
 
 - **Surface `oversized_skipped` counters more loudly** — e.g. as a WARN log at end-of-run when non-zero, so users don't silently miss 100 GB of data under default settings.
@@ -171,4 +199,4 @@ The sidecar is **not** a security-sensitive cache: a fingerprint collision would
 - ~~Extend `index-perm` to seekable-zstd inputs (today it only works on plain .jsonl) so we can recommend it without asking users to decompress first.~~ **Done in PR-22; sidecar added in PR-23 (see §13).**
 - **Default `--threads=0` may be suboptimal on hyperthreaded CPUs.** Consider defaulting to `num_physical_cpus()` instead of `available_parallelism()` when the host reports more logical than physical cores.
 - Parallel reader path: split a seekable input file into regions, `pread` in parallel, reassemble. Would push the local-plain ceiling higher than 2.37 GB/s.
-- **Parallel frame-decode for `index-perm` on seekable-zstd.** Today each emitted record costs one frame decode (~3–4 ms). A small thread pool doing N decodes concurrently would hide most of that latency for bulk uniform shuffles. Not yet implemented — `--sample=N` with small N is already fast, and users who need full-uniform-shuffle throughput can still decompress to `.jsonl` first and use the plain-file path.
+- **Parallel frame-decode for `index-perm` on seekable-zstd emit phase.** Today each emitted record still costs one frame decode (~3–4 ms). PR-26 parallelizes the *build* phase; the *emit* phase still decodes serially. For `--sample=N` with small N that's fine (~N × 3 ms); full-uniform emit would benefit. Not yet implemented — see §14 for the build-phase win.

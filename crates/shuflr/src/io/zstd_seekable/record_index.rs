@@ -135,6 +135,151 @@ impl RecordIndex {
         ))
     }
 
+    /// Build by decoding frames in parallel across a worker pool. Each
+    /// worker opens its own read-only `File` handle and `pread`s the
+    /// frame byte range (no shared `SeekableReader`). Records are
+    /// flattened back into `entries` in `frame_id` order, so the
+    /// resulting index is byte-identical to [`build`].
+    ///
+    /// `threads` clamps the pool size; 0 means "physical cores"
+    /// (matches the convert path's default — zstd decompression is
+    /// compute-heavy enough that SMT doesn't help).
+    pub fn build_parallel<F>(path: &Path, threads: usize, on_frame: F) -> Result<(Self, u64)>
+    where
+        F: Fn(usize, usize) + Send + Sync,
+    {
+        use crossbeam_channel::{bounded, unbounded};
+        use std::io::{Read, Seek, SeekFrom};
+
+        let reader = SeekableReader::open(path)?;
+        let n_frames = reader.num_frames();
+        if n_frames == 0 {
+            return Ok((
+                Self {
+                    entries: Vec::new(),
+                    fingerprint: None,
+                },
+                0,
+            ));
+        }
+        let entries_table = reader.entries().to_vec();
+        let mut offsets = Vec::with_capacity(n_frames + 1);
+        let mut acc: u64 = 0;
+        for e in &entries_table {
+            offsets.push(acc);
+            acc += u64::from(e.compressed_size);
+        }
+        offsets.push(acc);
+        drop(reader);
+
+        let threads = if threads == 0 {
+            num_cpus::get_physical().max(1)
+        } else {
+            threads
+        };
+        let threads = threads.min(n_frames);
+
+        // Workers pull frame_ids and return (frame_id, locs, scanned)
+        // tuples on the done channel. Driver collects out-of-order,
+        // reassembles in ascending frame_id order.
+        let (job_tx, job_rx) = bounded::<usize>(threads * 4);
+        let (done_tx, done_rx) = unbounded::<(usize, Vec<RecordLocation>, u64)>();
+        let entries_table_ref = &entries_table;
+        let offsets_ref = &offsets;
+        let on_frame_ref = &on_frame;
+
+        std::thread::scope(|s| -> Result<()> {
+            let worker_handles: Vec<_> = (0..threads)
+                .map(|_| {
+                    let rx = job_rx.clone();
+                    let tx = done_tx.clone();
+                    s.spawn(move || -> Result<()> {
+                        let mut file = std::fs::File::open(path).map_err(Error::Io)?;
+                        while let Ok(frame_id) = rx.recv() {
+                            let offset = offsets_ref[frame_id];
+                            let comp_size = entries_table_ref[frame_id].compressed_size as usize;
+                            file.seek(SeekFrom::Start(offset)).map_err(Error::Io)?;
+                            let mut comp = vec![0u8; comp_size];
+                            file.read_exact(&mut comp).map_err(Error::Io)?;
+                            let bytes = zstd::stream::decode_all(&comp[..]).map_err(Error::Io)?;
+                            let scanned = bytes.len() as u64;
+                            let fid = u32::try_from(frame_id).map_err(|_| {
+                                Error::Input(format!("frame_id {frame_id} exceeds u32"))
+                            })?;
+                            let mut locs = Vec::new();
+                            let mut start: usize = 0;
+                            for nl in memchr::memchr_iter(b'\n', &bytes) {
+                                let end = nl + 1;
+                                let length = u32::try_from(end - start).map_err(|_| {
+                                    Error::Input(format!("frame {frame_id} record > 4 GiB"))
+                                })?;
+                                let off = u32::try_from(start).map_err(|_| {
+                                    Error::Input(format!("frame {frame_id} offset > u32"))
+                                })?;
+                                locs.push(RecordLocation {
+                                    frame_id: fid,
+                                    offset_in_frame: off,
+                                    length,
+                                });
+                                start = end;
+                            }
+                            if start < bytes.len() {
+                                locs.push(RecordLocation {
+                                    frame_id: fid,
+                                    offset_in_frame: start as u32,
+                                    length: (bytes.len() - start) as u32,
+                                });
+                            }
+                            if tx.send((frame_id, locs, scanned)).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            drop(done_tx);
+
+            for frame_id in 0..n_frames {
+                on_frame_ref(frame_id, n_frames);
+                if job_tx.send(frame_id).is_err() {
+                    break;
+                }
+            }
+            drop(job_tx);
+
+            for h in worker_handles {
+                h.join()
+                    .map_err(|_| Error::Input("record-index worker panicked".into()))??;
+            }
+            Ok(())
+        })?;
+
+        // Reassemble in ascending frame_id order.
+        let mut slots: Vec<Option<Vec<RecordLocation>>> = (0..n_frames).map(|_| None).collect();
+        let mut total_scanned: u64 = 0;
+        for (frame_id, locs, scanned) in done_rx {
+            slots[frame_id] = Some(locs);
+            total_scanned += scanned;
+        }
+        let total: usize = slots
+            .iter()
+            .map(|s| s.as_ref().map(|v| v.len()).unwrap_or(0))
+            .sum();
+        let mut entries: Vec<RecordLocation> = Vec::with_capacity(total);
+        for slot in slots.into_iter().flatten() {
+            entries.extend(slot);
+        }
+
+        Ok((
+            Self {
+                entries,
+                fingerprint: None,
+            },
+            total_scanned,
+        ))
+    }
+
     /// Serialize to `out` in the wire format above.
     pub fn write_to(&self, mut out: impl Write, fingerprint: Fingerprint) -> Result<()> {
         out.write_all(MAGIC).map_err(Error::Io)?;
@@ -355,6 +500,50 @@ mod tests {
     }
 
     #[test]
+    fn build_parallel_matches_sequential() {
+        let records: Vec<String> = (0..500).map(|i| format!("r{i:04}\n")).collect();
+        let record_refs: Vec<&[u8]> = records.iter().map(|s| s.as_bytes()).collect();
+        let tf = build_fixture(&record_refs);
+
+        let mut reader = SeekableReader::open(tf.path()).unwrap();
+        let (seq_idx, seq_bytes) = RecordIndex::build(&mut reader).unwrap();
+
+        // Force multiple workers so the merge path is exercised.
+        let (par_idx, par_bytes) = RecordIndex::build_parallel(tf.path(), 4, |_, _| {}).unwrap();
+
+        assert_eq!(par_idx.entries.len(), seq_idx.entries.len());
+        assert_eq!(par_idx.entries, seq_idx.entries);
+        assert_eq!(par_bytes, seq_bytes);
+    }
+
+    #[test]
+    fn build_parallel_with_one_thread_behaves_like_sequential() {
+        let records: Vec<String> = (0..80).map(|i| format!("r{i:02}\n")).collect();
+        let record_refs: Vec<&[u8]> = records.iter().map(|s| s.as_bytes()).collect();
+        let tf = build_fixture(&record_refs);
+
+        let (par_idx, _) = RecordIndex::build_parallel(tf.path(), 1, |_, _| {}).unwrap();
+        let mut reader = SeekableReader::open(tf.path()).unwrap();
+        let (seq_idx, _) = RecordIndex::build(&mut reader).unwrap();
+        assert_eq!(par_idx.entries, seq_idx.entries);
+    }
+
+    #[test]
+    fn build_parallel_handles_zero_frames_gracefully() {
+        // Emptiest legal fixture: build a seekable from zero records. The
+        // writer should still produce a valid table; if not, this test
+        // will at least prove we don't panic on n_frames == 0.
+        let tf = build_fixture(&[]);
+        let result = RecordIndex::build_parallel(tf.path(), 4, |_, _| {});
+        // Either an empty index or an error from the reader itself; must
+        // not panic.
+        if let Ok((idx, bytes)) = result {
+            assert_eq!(idx.entries.len(), 0);
+            assert_eq!(bytes, 0);
+        }
+    }
+
+    #[test]
     fn build_with_progress_fires_once_per_frame_in_order() {
         let records: Vec<String> = (0..200).map(|i| format!("rec_{i:03}\n")).collect();
         let record_refs: Vec<&[u8]> = records.iter().map(|s| s.as_bytes()).collect();
@@ -367,8 +556,7 @@ mod tests {
             "test fixture must have multiple frames; got {expected_frames}"
         );
 
-        let seen: std::cell::RefCell<Vec<(usize, usize)>> =
-            std::cell::RefCell::new(Vec::new());
+        let seen: std::cell::RefCell<Vec<(usize, usize)>> = std::cell::RefCell::new(Vec::new());
         let (_idx, _) = RecordIndex::build_with_progress(&mut reader, |i, n| {
             seen.borrow_mut().push((i, n));
         })
