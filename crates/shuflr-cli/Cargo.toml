@@ -1,0 +1,35 @@
+[package]
+name = "shuflr-cli"
+description = "Command-line interface for shuflr (produces the `shuflr` binary)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "shuflr"
+path = "src/main.rs"
+
+[features]
+default = []
+grpc = ["shuflr/grpc"]
+prom = ["shuflr/prom"]
+otlp = ["shuflr/otlp"]
+uring = ["shuflr/uring"]
+zstd = ["shuflr/zstd"]
+gzip = ["shuflr/gzip"]
+s3 = ["shuflr/s3"]
+gcs = ["shuflr/gcs"]
+sandbox = ["shuflr/sandbox"]
+# Canonical build presets.
+serve = ["grpc", "prom"]
+full = ["serve", "otlp", "uring", "zstd", "gzip", "s3", "gcs", "sandbox"]
+
+[dependencies]
+shuflr = { path = "../shuflr" }
+anyhow = "1"

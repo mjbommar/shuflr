@@ -1,0 +1,5 @@
+/target
+**/*.rs.bk
+*.idx
+tests/corpora/large/
+.DS_Store

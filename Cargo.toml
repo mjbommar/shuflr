@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/shuflr",
+    "crates/shuflr-cli",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Michael Bommarito <michael.bommarito@gmail.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mjbommar/shuflr"
+homepage = "https://github.com/mjbommar/shuflr"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "warn"
+print_stdout = "warn"    # stdout is the data channel — sinks take impl Write
+print_stderr = "allow"   # tracing + eprintln for placeholder main
+needless_collect = "warn"
+redundant_clone = "warn"
+manual_let_else = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,68 @@
+[package]
+name = "shuflr"
+description = "Streaming shuffled JSONL: chunk pool, shuffle algorithms, I/O, sinks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Networked service (gRPC, async runtime).
+grpc = ["dep:tonic", "dep:prost", "dep:tokio"]
+# Prometheus exporter for --stats.
+prom = ["dep:metrics", "dep:metrics-exporter-prometheus"]
+# OTLP tracing export.
+otlp = ["dep:opentelemetry-otlp"]
+# Linux io_uring fast path.
+uring = ["dep:io-uring"]
+# Seekable-zstd input (v1.1).
+zstd = ["dep:zstd"]
+# Gzip input (v1.1).
+gzip = ["dep:flate2"]
+# S3 byte-range input (v1.1).
+s3 = ["dep:aws-sdk-s3"]
+# GCS byte-range input (v1.1).
+gcs = ["dep:google-cloud-storage"]
+# Linux Landlock + seccomp sandbox.
+sandbox = ["dep:landlock", "dep:seccompiler"]
+
+[dependencies]
+# Core deps are intentionally few; all feature-gated deps below are optional.
+memmap2 = "0.9"
+memchr = "2"
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+rand_chacha = "0.3"
+blake3 = "1"
+crossbeam-channel = "0.5"
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+
+# Feature-gated deps — all optional, pulled in only when a feature enables them.
+tonic = { version = "0.12", optional = true }
+prost = { version = "0.13", optional = true }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "sync", "macros"] }
+metrics = { version = "0.23", optional = true }
+metrics-exporter-prometheus = { version = "0.15", optional = true }
+opentelemetry-otlp = { version = "0.27", optional = true }
+io-uring = { version = "0.7", optional = true }
+zstd = { version = "0.13", optional = true }
+flate2 = { version = "1", optional = true }
+aws-sdk-s3 = { version = "1", optional = true }
+google-cloud-storage = { version = "0.22", optional = true }
+landlock = { version = "0.4", optional = true }
+seccompiler = { version = "0.4", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "throughput"
+harness = false
