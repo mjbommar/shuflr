@@ -233,6 +233,17 @@ pub struct ConvertArgs {
     #[arg(long, value_name = "P", value_parser = parse_probability)]
     pub sample_rate: Option<f64>,
 
+    /// Drop records with Shannon entropy below this many bits-per-byte.
+    /// Useful for kicking out boilerplate (typical boilerplate < 2 bits;
+    /// English text ~4 bits; random data 8 bits). Units: bits. Max 8.
+    #[arg(long, value_name = "BITS", value_parser = parse_entropy_bits)]
+    pub min_entropy: Option<f64>,
+
+    /// Drop records with Shannon entropy above this many bits-per-byte.
+    /// Useful for flagging binary/garbage records (>7 bits typical).
+    #[arg(long, value_name = "BITS", value_parser = parse_entropy_bits)]
+    pub max_entropy: Option<f64>,
+
     /// Reproducibility seed for --sample-rate. Inherits SHUFLR_SEED if set.
     #[arg(long, env = "SHUFLR_SEED", value_name = "U64")]
     pub seed: Option<u64>,
@@ -359,6 +370,20 @@ pub enum InputFormat {
     Bz2,
     #[cfg(feature = "xz")]
     Xz,
+}
+
+/// Parse a bits-per-byte entropy in `[0.0, 8.0]` (Shannon, log2 base —
+/// 8 bits is the maximum for a uniform-random byte stream).
+fn parse_entropy_bits(raw: &str) -> std::result::Result<f64, String> {
+    let h: f64 = raw
+        .parse()
+        .map_err(|e| format!("invalid entropy '{raw}': {e}"))?;
+    if !(0.0..=8.0).contains(&h) {
+        return Err(format!(
+            "entropy {h} bits is outside [0, 8] (max entropy for a byte is 8 bits)"
+        ));
+    }
+    Ok(h)
 }
 
 /// Parse a probability in `[0.0, 1.0]`. Rejects values outside that range

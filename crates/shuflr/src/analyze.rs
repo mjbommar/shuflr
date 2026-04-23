@@ -225,9 +225,9 @@ fn js_divergence(p: &[f64; 256], q: &[f64; 256]) -> f64 {
 #[cfg(feature = "zstd")]
 fn entropy(p: &[f64; 256]) -> f64 {
     let mut h = 0.0;
-    for i in 0..256 {
-        if p[i] > 0.0 {
-            h -= p[i] * p[i].ln();
+    for &pi in p {
+        if pi > 0.0 {
+            h -= pi * pi.ln();
         }
     }
     h

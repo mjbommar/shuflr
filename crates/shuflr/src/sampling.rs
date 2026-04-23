@@ -1,15 +1,19 @@
 //! Record-level sampling transforms that wrap any `Read` and re-expose a
-//! `Read` with filtered contents. Two modes:
+//! `Read` with filtered contents. Three orthogonal modes, composable:
 //!
 //! - **Head limit** (`limit = Some(N)`): pass records through until `N`
 //!   have been emitted, then report EOF.
 //! - **Bernoulli filter** (`sample_rate = Some(p)`): each input record is
 //!   kept with probability `p`, independently, using a seeded ChaCha20Rng.
+//! - **Entropy gate** (`min_entropy_nats` / `max_entropy_nats`): drop
+//!   records whose byte-distribution Shannon entropy falls outside the
+//!   given range. Useful for kicking out boilerplate (entropy below
+//!   ~2 bits), random/binary blobs (>7 bits), and anything else the
+//!   user has an empirical threshold for.
 //!
-//! The two combine: `sample_rate=p, limit=N` → Bernoulli sampling with an
-//! early termination after `N` accepted records, which is what the user
-//! wants for "1% of records, capped at 1M" style workflows on a huge
-//! compressed corpus.
+//! All three combine: `sample_rate=p, limit=N, min_entropy_nats=M` →
+//! Bernoulli sampling that only accepts records passing the entropy
+//! gate, stopping early after `N` survivors.
 //!
 //! Reservoir sampling (exactly K uniform-random) isn't in this module
 //! because it needs to hold K records in memory and emit them only after
@@ -29,7 +33,11 @@ pub struct SamplingReader<R: Read> {
     rng: Option<ChaCha20Rng>,
     sample_rate: Option<f64>,
     limit: Option<u64>,
+    min_entropy_nats: Option<f64>,
+    max_entropy_nats: Option<f64>,
     kept: u64,
+    entropy_dropped_low: u64,
+    entropy_dropped_high: u64,
     /// Current accepted record's bytes, awaiting emit.
     line_buf: Vec<u8>,
     /// Position in `line_buf` of the next byte to emit.
@@ -38,15 +46,48 @@ pub struct SamplingReader<R: Read> {
     done: bool,
 }
 
+/// Configuration bundle for [`SamplingReader::with_config`]. Kept as a
+/// separate struct so adding a new gate doesn't bloat the constructor
+/// signature.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct SamplingConfig {
+    pub sample_rate: Option<f64>,
+    pub limit: Option<u64>,
+    pub seed: u64,
+    pub min_entropy_nats: Option<f64>,
+    pub max_entropy_nats: Option<f64>,
+}
+
 impl<R: Read> SamplingReader<R> {
+    /// Constructor for the two-field (sample_rate + limit) shape that
+    /// PR-14 introduced. Kept as the backwards-compatible API; new call
+    /// sites should prefer [`with_config`] which accepts entropy gates.
     pub fn new(inner: R, sample_rate: Option<f64>, limit: Option<u64>, seed: u64) -> Self {
-        let rng = sample_rate.map(|_| ChaCha20Rng::seed_from_u64(seed));
+        Self::with_config(
+            inner,
+            SamplingConfig {
+                sample_rate,
+                limit,
+                seed,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn with_config(inner: R, cfg: SamplingConfig) -> Self {
+        let rng = cfg
+            .sample_rate
+            .map(|_| ChaCha20Rng::seed_from_u64(cfg.seed));
         Self {
             inner: BufReader::with_capacity(2 * 1024 * 1024, inner),
             rng,
-            sample_rate,
-            limit,
+            sample_rate: cfg.sample_rate,
+            limit: cfg.limit,
+            min_entropy_nats: cfg.min_entropy_nats,
+            max_entropy_nats: cfg.max_entropy_nats,
             kept: 0,
+            entropy_dropped_low: 0,
+            entropy_dropped_high: 0,
             line_buf: Vec::with_capacity(8 * 1024),
             emit_cursor: 0,
             done: false,
@@ -57,6 +98,35 @@ impl<R: Read> SamplingReader<R> {
     pub fn records_kept(&self) -> u64 {
         self.kept
     }
+
+    pub fn entropy_dropped_low(&self) -> u64 {
+        self.entropy_dropped_low
+    }
+
+    pub fn entropy_dropped_high(&self) -> u64 {
+        self.entropy_dropped_high
+    }
+}
+
+/// Shannon entropy of a byte sequence, in nats. `H(p) = -Σ p_i · ln(p_i)`
+/// over a 256-bin byte histogram. Returns 0 for empty input.
+pub fn shannon_entropy_nats(bytes: &[u8]) -> f64 {
+    if bytes.is_empty() {
+        return 0.0;
+    }
+    let mut hist = [0u32; 256];
+    for &b in bytes {
+        hist[b as usize] += 1;
+    }
+    let n = bytes.len() as f64;
+    let mut h = 0.0;
+    for &count in &hist {
+        if count > 0 {
+            let p = count as f64 / n;
+            h -= p * p.ln();
+        }
+    }
+    h
 }
 
 impl<R: Read> Read for SamplingReader<R> {
@@ -97,8 +167,32 @@ impl<R: Read> Read for SamplingReader<R> {
                 continue;
             }
 
-            // 4. Count toward limit (applied after Bernoulli so "--limit N
-            //    --sample-rate 0.01" means "stop after N kept records").
+            // 3b. Entropy gate. Computed only if a bound is set (Shannon
+            //     entropy over byte histogram is ~200 MB/s per core, not
+            //     free).
+            if self.min_entropy_nats.is_some() || self.max_entropy_nats.is_some() {
+                let h = shannon_entropy_nats(&self.line_buf);
+                if let Some(min) = self.min_entropy_nats
+                    && h < min
+                {
+                    self.entropy_dropped_low += 1;
+                    self.line_buf.clear();
+                    self.emit_cursor = 0;
+                    continue;
+                }
+                if let Some(max) = self.max_entropy_nats
+                    && h > max
+                {
+                    self.entropy_dropped_high += 1;
+                    self.line_buf.clear();
+                    self.emit_cursor = 0;
+                    continue;
+                }
+            }
+
+            // 4. Count toward limit (applied after all drops so "--limit N
+            //    --sample-rate 0.01 --min-entropy 3" means "stop after N
+            //    kept records that passed every gate").
             self.kept += 1;
             if let Some(cap) = self.limit
                 && self.kept > cap
@@ -236,5 +330,105 @@ mod tests {
         let sr = SamplingReader::new(&input[..], None, None, 0);
         let out = read_all(sr);
         assert_eq!(out, input);
+    }
+
+    #[test]
+    fn shannon_entropy_bounds() {
+        // Uniform random over one symbol: entropy = 0.
+        assert_eq!(shannon_entropy_nats(&[b'x'; 100]), 0.0);
+        // All-256 bytes each appearing once: entropy = ln(256).
+        let uniform: Vec<u8> = (0u8..=255u8).collect();
+        let h = shannon_entropy_nats(&uniform);
+        assert!((h - 256f64.ln()).abs() < 1e-9);
+        // Empty input: 0.
+        assert_eq!(shannon_entropy_nats(&[]), 0.0);
+    }
+
+    #[test]
+    fn min_entropy_drops_low_entropy_records() {
+        // Three records: all-x (H=0), plain text (H~medium), all-zeros (H=0).
+        let input: &[u8] = b"xxxxxxxx\nhello world, this is text\n00000000\n";
+        let sr = SamplingReader::with_config(
+            input,
+            SamplingConfig {
+                min_entropy_nats: Some(1.0),
+                ..Default::default()
+            },
+        );
+        let (out, dropped_low, dropped_high) = {
+            let mut buf = Vec::new();
+            let mut reader = SamplingReader::with_config(
+                input,
+                SamplingConfig {
+                    min_entropy_nats: Some(1.0),
+                    ..Default::default()
+                },
+            );
+            reader.read_to_end(&mut buf).unwrap();
+            (
+                buf,
+                reader.entropy_dropped_low(),
+                reader.entropy_dropped_high(),
+            )
+        };
+        let _ = sr;
+        assert_eq!(out, b"hello world, this is text\n");
+        assert_eq!(dropped_low, 2);
+        assert_eq!(dropped_high, 0);
+    }
+
+    #[test]
+    fn max_entropy_drops_high_entropy_records() {
+        // Binary-noise record = 255 distinct byte values (skipping the
+        // newline byte 0x0A so read_until doesn't split it) followed by \n.
+        // Entropy ≈ ln 255 ≈ 5.54 nats. Plain text ~3 nats. max=4 drops
+        // the noisy one.
+        let mut bin = Vec::new();
+        for b in 0u8..=255u8 {
+            if b != b'\n' {
+                bin.push(b);
+            }
+        }
+        bin.push(b'\n');
+        let mut input = Vec::from(&b"hello world, some english text\n"[..]);
+        input.extend_from_slice(&bin);
+
+        let mut reader = SamplingReader::with_config(
+            &input[..],
+            SamplingConfig {
+                max_entropy_nats: Some(4.0),
+                ..Default::default()
+            },
+        );
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"hello world, some english text\n");
+        assert_eq!(reader.entropy_dropped_high(), 1);
+        assert_eq!(reader.entropy_dropped_low(), 0);
+    }
+
+    #[test]
+    fn entropy_combines_with_bernoulli_and_limit() {
+        // Entropy filter runs before the limit gate. With rate=1.0,
+        // min_entropy=1, limit=2 on `xxxx / hello / world / xxxx / more`
+        // we see: xxxx drop, hello keep (1), world keep (2), xxxx drop,
+        // then "more" triggers kept>cap and reports EOF. So output is
+        // "hello\nworld\n" and both xxxx records are counted as
+        // dropped_low.
+        let input: &[u8] = b"xxxx\nhello\nworld\nxxxx\nmore words here\n";
+        let mut reader = SamplingReader::with_config(
+            input,
+            SamplingConfig {
+                sample_rate: Some(1.0),
+                limit: Some(2),
+                min_entropy_nats: Some(1.0),
+                seed: 0,
+                ..Default::default()
+            },
+        );
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"hello\nworld\n");
+        assert_eq!(reader.entropy_dropped_low(), 2);
     }
 }

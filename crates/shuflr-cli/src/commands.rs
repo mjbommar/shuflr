@@ -653,15 +653,21 @@ fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
         None
     };
 
-    // If --limit or --sample-rate is set, insert a record-level sampling
-    // filter between the (decompressed) input stream and the writer. The
-    // filter counts and filters records; the writer sees a plain stream of
-    // accepted records only.
-    let sampling_active = args.limit.is_some() || args.sample_rate.is_some();
+    // If any filter flag is set, insert a record-level sampling filter
+    // between the (decompressed) input stream and the writer.
+    let bits_to_nats = std::f64::consts::LN_2;
+    let min_entropy_nats = args.min_entropy.map(|b| b * bits_to_nats);
+    let max_entropy_nats = args.max_entropy.map(|b| b * bits_to_nats);
+    let sampling_active = args.limit.is_some()
+        || args.sample_rate.is_some()
+        || min_entropy_nats.is_some()
+        || max_entropy_nats.is_some();
     if sampling_active {
         tracing::info!(
             limit = ?args.limit,
             sample_rate = ?args.sample_rate,
+            min_entropy_bits = ?args.min_entropy,
+            max_entropy_bits = ?args.max_entropy,
             seed = args.seed.unwrap_or(0),
             "record sampling active",
         );
@@ -670,20 +676,21 @@ fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
 
     // Compose the reader stack from bottom to top:
     //   Input  →  ProgressReader  →  SamplingReader  →  (writer input)
-    // The progress bar sees INPUT bytes (so it reflects decompressed-stream
-    // progress, which is the knob users care about), while the sampling
-    // filter trims records before they reach the writer.
     let progress_bar = bar.clone();
     let with_progress: Box<dyn Read + Send> = match progress_bar {
         Some(pb) => Box::new(progress::ProgressReader::new(input, pb)),
         None => Box::new(input),
     };
     let source: Box<dyn Read + Send> = if sampling_active {
-        Box::new(shuflr::SamplingReader::new(
+        Box::new(shuflr::SamplingReader::with_config(
             with_progress,
-            args.sample_rate,
-            args.limit,
-            seed,
+            shuflr::sampling::SamplingConfig {
+                sample_rate: args.sample_rate,
+                limit: args.limit,
+                seed,
+                min_entropy_nats,
+                max_entropy_nats,
+            },
         ))
     } else {
         with_progress
