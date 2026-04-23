@@ -69,6 +69,26 @@ pub enum Command {
     Completions(CompletionsArgs),
 }
 
+impl Command {
+    /// The effective log-level string for this invocation, or `"info"` for
+    /// subcommands that don't take one (completions / info).
+    pub fn log_level(&self) -> &str {
+        match self {
+            Self::Stream(a) => &a.log_level,
+            #[cfg(feature = "grpc")]
+            Self::Serve(a) => &a.log_level,
+            #[cfg(feature = "zstd")]
+            Self::Convert(a) => &a.log_level,
+            #[cfg(feature = "zstd")]
+            Self::Info(_) => "info",
+            Self::Analyze(_) => "info",
+            Self::Index(_) => "info",
+            Self::Verify(_) => "info",
+            Self::Completions(_) => "warn",
+        }
+    }
+}
+
 /// Arguments shared by `stream`, `analyze`, and `verify` — anything that reads inputs.
 #[derive(Args, Debug, Clone)]
 pub struct InputArgs {
@@ -111,6 +131,14 @@ pub struct StreamArgs {
     /// Total rank count; used with --rank
     #[arg(long, requires = "rank", value_name = "W")]
     pub world_size: Option<u32>,
+
+    /// Policy for records that exceed --max-line
+    #[arg(long, value_enum, default_value_t = OnErrorPolicy::Skip, value_name = "POLICY")]
+    pub on_error: OnErrorPolicy,
+
+    /// Per-record byte cap
+    #[arg(long, default_value = "16MiB", value_parser = parse_bytes, value_name = "BYTES")]
+    pub max_line: u64,
 
     /// Progress bar visibility
     #[arg(long, value_enum, default_value_t = When::Auto, value_name = "WHEN")]
@@ -241,7 +269,7 @@ pub struct CompletionsArgs {
     pub shell: Shell,
 }
 
-#[derive(Copy, Clone, Debug, ValueEnum)]
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
 pub enum ShuffleMode {
     /// Pass-through, no shuffle
     None,
@@ -255,6 +283,26 @@ pub enum ShuffleMode {
     Buffer,
     /// Vitter Algorithm R; emits exactly K records
     Reservoir,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+pub enum OnErrorPolicy {
+    /// Drop malformed/oversized records and count them (default)
+    Skip,
+    /// Abort on first offending record
+    Fail,
+    /// Emit the record anyway
+    Passthrough,
+}
+
+impl From<OnErrorPolicy> for shuflr::OnError {
+    fn from(p: OnErrorPolicy) -> Self {
+        match p {
+            OnErrorPolicy::Skip => shuflr::OnError::Skip,
+            OnErrorPolicy::Fail => shuflr::OnError::Fail,
+            OnErrorPolicy::Passthrough => shuflr::OnError::Passthrough,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -277,8 +325,7 @@ pub enum InputFormat {
 }
 
 /// Parse a byte count like `16MiB`, `2MB`, `1024` into bytes.
-#[cfg(any(feature = "zstd", test))]
-fn parse_bytes(raw: &str) -> std::result::Result<u64, String> {
+pub(crate) fn parse_bytes(raw: &str) -> std::result::Result<u64, String> {
     let raw = raw.trim();
     let (num, suffix) = raw
         .find(|c: char| !c.is_ascii_digit() && c != '.')
@@ -316,12 +363,22 @@ fn rewrite_implicit_stream(mut argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::O
     if argv.len() < 2 {
         return argv;
     }
-    let first = argv[1].to_string_lossy();
-    if first.starts_with('-') {
-        // Top-level flag like --help / --version — let clap handle it.
+    // If any arg is a known subcommand name, trust the user; no rewrite.
+    let explicit_subcommand = argv[1..].iter().any(|a| {
+        let s = a.to_string_lossy();
+        SUBCOMMAND_NAMES.contains(&s.as_ref())
+    });
+    if explicit_subcommand {
         return argv;
     }
-    if SUBCOMMAND_NAMES.contains(&first.as_ref()) {
+    // If the user only asked for a top-level help/version marker, let clap handle it.
+    let only_top_level_pass = argv[1..].iter().all(|a| {
+        matches!(
+            a.to_string_lossy().as_ref(),
+            "--help" | "-h" | "--help-full" | "--version" | "-V"
+        )
+    });
+    if only_top_level_pass {
         return argv;
     }
     argv.insert(1, std::ffi::OsString::from("stream"));
@@ -357,6 +414,25 @@ mod tests {
         let in_ = vec!["shuflr".into(), "--version".into()];
         let out = rewrite_implicit_stream(in_.clone());
         assert_eq!(out, in_);
+    }
+
+    #[test]
+    fn implicit_stream_with_leading_flag() {
+        // `shuflr --shuffle none data.jsonl` should become `shuflr stream --shuffle none data.jsonl`
+        let in_ = vec![
+            "shuflr".into(),
+            "--shuffle".into(),
+            "none".into(),
+            "data.jsonl".into(),
+        ];
+        let out = rewrite_implicit_stream(in_);
+        assert_eq!(
+            out,
+            vec!["shuflr", "stream", "--shuffle", "none", "data.jsonl"]
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

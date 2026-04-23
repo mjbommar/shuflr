@@ -3211,6 +3211,7 @@ dependencies = [
  "rand 0.8.6",
  "rand_chacha 0.3.1",
  "seccompiler",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tonic",
@@ -3229,6 +3230,7 @@ dependencies = [
  "clap_complete",
  "predicates",
  "shuflr",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]

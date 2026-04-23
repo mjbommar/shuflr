@@ -80,7 +80,7 @@ Two crates, not four. The library `shuflr` contains all engine modules (`shuffle
 
 ## Current status
 
-Iteration 2 — workspace scaffolded (2 crates), CI stub wired, design frozen as 002. No algorithm code yet. First implementation PR target: `shuffle::none` + `io::pread` + CLI skeleton.
+Through PR-2: CLI subcommand dispatch plus `--shuffle=none` passthrough for plain JSONL files and stdin. Compressed inputs rejected with actionable error pointing at `zstdcat` / `gunzip -c`. Criterion throughput baseline: 5.35 GiB/s on 128 MiB × 8 KiB synthetic fixture (128 MB); ~1.33 GB/s on real EDGAR corpus (zstdcat-bottlenecked). 49 tests green (23 lib unit + 3 lib integration + 4 CLI unit + 19 CLI integration). Next: PR-3 adds streaming gzip / zstd decompressors behind feature flags.
 
 ## Upstream
 

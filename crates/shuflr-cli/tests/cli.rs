@@ -126,3 +126,105 @@ fn rank_requires_world_size() {
         .failure()
         .stderr(predicate::str::contains("world-size"));
 }
+
+fn tiny_corpus() -> std::path::PathBuf {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest.ancestors().nth(2).unwrap();
+    workspace.join("tests/corpora/tiny.jsonl")
+}
+
+#[test]
+fn stream_none_roundtrips_tiny_fixture() {
+    let path = tiny_corpus();
+    let assert = shuflr()
+        .args(["stream", "--shuffle", "none"])
+        .arg(&path)
+        .assert()
+        .success();
+    let expected = std::fs::read(&path).unwrap();
+    assert.stdout(expected);
+}
+
+#[test]
+fn implicit_stream_still_errors_on_default_mode_stub() {
+    // Default --shuffle is chunk-shuffled which is stubbed; user gets a clear message.
+    shuflr()
+        .arg(tiny_corpus())
+        .assert()
+        .code(69)
+        .stderr(predicate::str::contains("not yet implemented"));
+}
+
+#[test]
+fn stream_none_honors_sample() {
+    let path = tiny_corpus();
+    let assert = shuflr()
+        .args(["stream", "--shuffle", "none", "--sample", "2"])
+        .arg(&path)
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert_eq!(out.lines().count(), 2, "expected exactly 2 records:\n{out}");
+}
+
+#[test]
+fn stream_none_rejects_compressed_input_clearly() {
+    // Create a fake .gz in a tempdir with just the magic bytes — enough to trip the sniffer.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("oops.jsonl.gz");
+    std::fs::write(&path, [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0]).unwrap();
+    shuflr()
+        .args(["stream", "--shuffle", "none"])
+        .arg(&path)
+        .assert()
+        .code(64) // EX_USAGE
+        .stderr(predicate::str::contains("gzip"))
+        .stderr(predicate::str::contains("gunzip -c"));
+}
+
+#[test]
+fn stream_none_stdin_works() {
+    shuflr()
+        .args(["stream", "--shuffle", "none"])
+        .write_stdin("one\ntwo\nthree\n")
+        .assert()
+        .success()
+        .stdout("one\ntwo\nthree\n");
+}
+
+#[test]
+fn stream_none_patches_missing_trailing_newline() {
+    shuflr()
+        .args(["stream", "--shuffle", "none"])
+        .write_stdin("a\nb")
+        .assert()
+        .success()
+        .stdout("a\nb\n");
+}
+
+#[test]
+fn stream_none_exit_65_on_fail_policy() {
+    shuflr()
+        .args([
+            "stream",
+            "--shuffle",
+            "none",
+            "--max-line",
+            "5",
+            "--on-error",
+            "fail",
+        ])
+        .write_stdin("ok\nWAY_TOO_LONG\n")
+        .assert()
+        .code(65) // EX_DATAERR
+        .stderr(predicate::str::contains("oversized"));
+}
+
+#[test]
+fn stream_none_exit_66_on_missing_input() {
+    shuflr()
+        .args(["stream", "--shuffle", "none", "/does/not/exist.jsonl"])
+        .assert()
+        .code(66) // EX_NOINPUT
+        .stderr(predicate::str::contains("no such file"));
+}

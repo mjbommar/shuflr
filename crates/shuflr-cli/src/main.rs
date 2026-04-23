@@ -1,8 +1,8 @@
 //! `shuflr` — streaming shuffled JSONL.
 //!
-//! PR-1 scope: argument parsing, subcommand dispatch, exit codes, and a
-//! panic hook that keeps the failure mode boring. All subcommands are
-//! stubbed; see `commands` and the design docs for what lands next.
+//! PR-2 scope: CLI dispatch + `--shuffle=none` serial passthrough on plain
+//! JSONL files and stdin. Everything else is stubbed. See
+//! `docs/design/002-revised-plan.md` and amendments 003/004 for the plan.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -15,11 +15,12 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     install_panic_hook();
-    install_logging();
 
     let parsed = cli::parse();
+    install_logging(parsed.command.log_level());
+
     let code = match parsed.command {
-        cli::Command::Stream(a) => commands::stream(a),
+        cli::Command::Stream(a) => commands::stream_dispatch(a),
         #[cfg(feature = "grpc")]
         cli::Command::Serve(a) => commands::serve(a),
         #[cfg(feature = "zstd")]
@@ -44,21 +45,22 @@ fn install_panic_hook() {
             "shuflr: internal error; please report at \
              https://github.com/mjbommar/shuflr/issues"
         );
-        // Keep the original hook for RUST_BACKTRACE=1 users.
         if std::env::var_os("RUST_BACKTRACE").is_some() {
             default(info);
         }
     }));
 }
 
-/// Install a tracing subscriber that honors `SHUFLR_LOG` / `RUST_LOG`,
-/// defaults to `info`, and writes to stderr so stdout stays clean.
-fn install_logging() {
+/// Install a tracing subscriber with a filter derived from (in order of priority):
+/// 1. `SHUFLR_LOG` env var (EnvFilter syntax — supports `info,hyper=warn` etc.)
+/// 2. `RUST_LOG` (standard convention; inherited from ecosystem tools)
+/// 3. The `--log-level` flag for the active subcommand
+fn install_logging(flag_default: &str) {
     use tracing_subscriber::{EnvFilter, fmt};
 
     let filter = EnvFilter::try_from_env("SHUFLR_LOG")
         .or_else(|_| EnvFilter::try_from_default_env())
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+        .unwrap_or_else(|_| EnvFilter::new(flag_default));
 
     let _ = fmt()
         .with_env_filter(filter)
