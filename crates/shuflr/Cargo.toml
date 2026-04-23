@@ -22,10 +22,14 @@ prom = ["dep:metrics", "dep:metrics-exporter-prometheus"]
 otlp = ["dep:opentelemetry-otlp"]
 # Linux io_uring fast path.
 uring = ["dep:io-uring"]
-# Seekable-zstd input (v1.1).
+# zstd streaming + seekable (004 promotes to v1).
 zstd = ["dep:zstd"]
-# Gzip input (v1.1).
+# gzip streaming input (003 promotes to v1).
 gzip = ["dep:flate2"]
+# bzip2 streaming input.
+bzip2 = ["dep:bzip2"]
+# xz/LZMA2 streaming input.
+xz = ["dep:xz2"]
 # S3 byte-range input (v1.1).
 s3 = ["dep:aws-sdk-s3"]
 # GCS byte-range input (v1.1).
@@ -55,6 +59,8 @@ opentelemetry-otlp = { version = "0.27", optional = true }
 io-uring = { version = "0.7", optional = true }
 zstd = { version = "0.13", optional = true }
 flate2 = { version = "1", optional = true }
+bzip2 = { version = "0.5", optional = true }
+xz2 = { version = "0.1", optional = true }
 aws-sdk-s3 = { version = "1", optional = true }
 google-cloud-storage = { version = "0.22", optional = true }
 landlock = { version = "0.4", optional = true }

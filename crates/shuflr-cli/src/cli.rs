@@ -1,0 +1,374 @@
+//! Command-line argument parsing.
+//!
+//! The CLI is subcommand-driven (002 §6.1). A bare invocation like
+//! `shuflr file.jsonl` is rewritten to `shuflr stream file.jsonl` in [`parse`]
+//! so `stream` is the implicit default.
+
+use std::path::PathBuf;
+
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
+
+/// The names of subcommands that must NOT be treated as implicit `stream` inputs.
+const SUBCOMMAND_NAMES: &[&str] = &[
+    "stream",
+    "serve",
+    "convert",
+    "info",
+    "analyze",
+    "index",
+    "verify",
+    "completions",
+    "help",
+];
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "shuflr",
+    version,
+    about = "Stream large JSONL in shuffled order, without loading it into memory.",
+    long_about = "shuflr streams records from JSONL files (optionally compressed) in \
+                  shuffled order without loading the file into memory. Works as a CLI \
+                  pipe or a gRPC service. See the subcommands for specific workflows; \
+                  `shuflr file.jsonl` is shorthand for `shuflr stream file.jsonl`.",
+    disable_help_subcommand = true,
+    arg_required_else_help = true
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Stream shuffled records to stdout (default when no subcommand given)
+    Stream(StreamArgs),
+
+    /// Serve shuffled records over gRPC or UDS
+    #[cfg(feature = "grpc")]
+    Serve(ServeArgs),
+
+    /// Convert JSONL (optionally compressed) to zstd-seekable format
+    #[cfg(feature = "zstd")]
+    Convert(ConvertArgs),
+
+    /// Show seekable file metadata (reads only the seek table; < 10ms)
+    #[cfg(feature = "zstd")]
+    Info(InfoArgs),
+
+    /// Scan a corpus and warn if chunk-shuffled would be unsafe
+    Analyze(AnalyzeArgs),
+
+    /// Build a .shuflr-idx file for index-perm mode
+    Index(IndexArgs),
+
+    /// Validate JSONL framing; exit 65 on malformed records
+    Verify(VerifyArgs),
+
+    /// Emit a shell completion script
+    Completions(CompletionsArgs),
+}
+
+/// Arguments shared by `stream`, `analyze`, and `verify` — anything that reads inputs.
+#[derive(Args, Debug, Clone)]
+pub struct InputArgs {
+    /// Input file(s). '-' or omitted reads from stdin.
+    #[arg(value_name = "INPUT", default_value = "-")]
+    pub inputs: Vec<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct StreamArgs {
+    #[command(flatten)]
+    pub input: InputArgs,
+
+    /// Shuffle mode
+    #[arg(
+        short = 's',
+        long,
+        value_enum,
+        default_value_t = ShuffleMode::ChunkShuffled,
+        value_name = "MODE",
+    )]
+    pub shuffle: ShuffleMode,
+
+    /// Reproducibility seed (env: SHUFLR_SEED)
+    #[arg(long, env = "SHUFLR_SEED", value_name = "U64")]
+    pub seed: Option<u64>,
+
+    /// Stop after N records (per epoch)
+    #[arg(short = 'n', long, value_name = "N")]
+    pub sample: Option<u64>,
+
+    /// Passes over the input (0 = infinite)
+    #[arg(short = 'e', long, default_value_t = 1, value_name = "N")]
+    pub epochs: u64,
+
+    /// Rank index for distributed partitioning (0-based)
+    #[arg(long, requires = "world_size", value_name = "R")]
+    pub rank: Option<u32>,
+
+    /// Total rank count; used with --rank
+    #[arg(long, requires = "rank", value_name = "W")]
+    pub world_size: Option<u32>,
+
+    /// Progress bar visibility
+    #[arg(long, value_enum, default_value_t = When::Auto, value_name = "WHEN")]
+    pub progress: When,
+
+    /// Logging level (or $SHUFLR_LOG)
+    #[arg(long, env = "SHUFLR_LOG", default_value = "info", value_name = "LEVEL")]
+    pub log_level: String,
+}
+
+#[cfg(feature = "grpc")]
+#[derive(Args, Debug)]
+pub struct ServeArgs {
+    /// gRPC listener address (e.g. grpc+tcp://127.0.0.1:50051 or grpc+unix:///path)
+    #[arg(long, value_name = "ADDR")]
+    pub grpc: String,
+
+    /// Map dataset_id to server-local path; repeatable
+    #[arg(long = "dataset", value_name = "ID=PATH")]
+    pub datasets: Vec<String>,
+
+    /// Allow non-loopback bind (requires --tls-cert/--tls-key)
+    #[arg(long)]
+    pub bind_public: bool,
+
+    /// Logging level (or $SHUFLR_LOG)
+    #[arg(long, env = "SHUFLR_LOG", default_value = "info", value_name = "LEVEL")]
+    pub log_level: String,
+}
+
+#[cfg(feature = "zstd")]
+#[derive(Args, Debug)]
+pub struct ConvertArgs {
+    #[command(flatten)]
+    pub input: InputArgs,
+
+    /// Output path; '-' writes to stdout
+    #[arg(short = 'o', long, value_name = "PATH")]
+    pub output: PathBuf,
+
+    /// zstd compression level (1..=22)
+    #[arg(short = 'l', long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=22))]
+    pub level: u32,
+
+    /// Target frame size (record-aligned, approximate)
+    #[arg(short = 'f', long, default_value = "2MiB", value_parser = parse_bytes, value_name = "BYTES")]
+    pub frame_size: u64,
+
+    /// Compression thread count (0 = cpu count)
+    #[arg(short = 'T', long, default_value_t = 0, value_name = "N")]
+    pub threads: u32,
+
+    /// Override input-format auto-detect
+    #[arg(long, value_enum, default_value_t = InputFormat::Auto)]
+    pub input_format: InputFormat,
+
+    /// Disable XXH64 per-frame checksums
+    #[arg(long)]
+    pub no_checksum: bool,
+
+    /// Disable record-aligned frames (saves ~3% ratio; breaks chunk-shuffled compat)
+    #[arg(long)]
+    pub no_record_align: bool,
+
+    /// After writing, re-read and verify (adds ~30% runtime)
+    #[arg(long)]
+    pub verify: bool,
+
+    /// Progress bar visibility
+    #[arg(long, value_enum, default_value_t = When::Auto, value_name = "WHEN")]
+    pub progress: When,
+
+    /// Logging level (or $SHUFLR_LOG)
+    #[arg(long, env = "SHUFLR_LOG", default_value = "info", value_name = "LEVEL")]
+    pub log_level: String,
+}
+
+#[cfg(feature = "zstd")]
+#[derive(Args, Debug)]
+pub struct InfoArgs {
+    /// Input file
+    #[arg(value_name = "FILE")]
+    pub input: PathBuf,
+
+    /// Emit machine-readable JSON instead of a human summary
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct AnalyzeArgs {
+    #[command(flatten)]
+    pub input: InputArgs,
+
+    /// Sample this many chunks for distribution checks
+    #[arg(long, default_value_t = 32, value_name = "N")]
+    pub sample_chunks: u32,
+
+    /// Exit 3 on unsafe verdict (for scripting); default exits 0 with warning
+    #[arg(long)]
+    pub strict: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct IndexArgs {
+    #[command(flatten)]
+    pub input: InputArgs,
+
+    /// Output index path (default: <input>.shuflr-idx)
+    #[arg(short = 'o', long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct VerifyArgs {
+    #[command(flatten)]
+    pub input: InputArgs,
+
+    /// Also parse each record as JSON (depth cap 128)
+    #[arg(long)]
+    pub deep: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct CompletionsArgs {
+    /// Target shell
+    #[arg(value_enum)]
+    pub shell: Shell,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum ShuffleMode {
+    /// Pass-through, no shuffle
+    None,
+    /// Round-robin across chunks (fastest shuffled; lowest quality)
+    ChunkRr,
+    /// Intra-chunk Fisher-Yates + weighted interleave (default)
+    ChunkShuffled,
+    /// Provably uniform permutation via persisted byte-offset index
+    IndexPerm,
+    /// K-buffer local shuffle (displacement bounded by K)
+    Buffer,
+    /// Vitter Algorithm R; emits exactly K records
+    Reservoir,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+pub enum When {
+    Never,
+    Auto,
+    Always,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+pub enum InputFormat {
+    Auto,
+    Plain,
+    Gzip,
+    Zstd,
+    #[cfg(feature = "bzip2")]
+    Bz2,
+    #[cfg(feature = "xz")]
+    Xz,
+}
+
+/// Parse a byte count like `16MiB`, `2MB`, `1024` into bytes.
+#[cfg(any(feature = "zstd", test))]
+fn parse_bytes(raw: &str) -> std::result::Result<u64, String> {
+    let raw = raw.trim();
+    let (num, suffix) = raw
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .map(|i| raw.split_at(i))
+        .unwrap_or((raw, ""));
+    let num: f64 = num
+        .parse()
+        .map_err(|e| format!("invalid number '{num}': {e}"))?;
+    let mult: u64 = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" => 1_000,
+        "ki" | "kib" => 1 << 10,
+        "m" | "mb" => 1_000_000,
+        "mi" | "mib" => 1 << 20,
+        "g" | "gb" => 1_000_000_000,
+        "gi" | "gib" => 1 << 30,
+        "t" | "tb" => 1_000_000_000_000,
+        "ti" | "tib" => 1 << 40,
+        other => return Err(format!("unknown byte suffix '{other}' (try KiB, MiB, GiB)")),
+    };
+    Ok((num * mult as f64) as u64)
+}
+
+/// Parse args, rewriting implicit-stream invocations.
+///
+/// If argv[1] is not a known subcommand, flag, or help marker, we insert
+/// `"stream"` at position 1. This makes `shuflr file.jsonl` shorthand for
+/// `shuflr stream file.jsonl`.
+pub fn parse() -> Cli {
+    let raw: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    Cli::parse_from(rewrite_implicit_stream(raw))
+}
+
+fn rewrite_implicit_stream(mut argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    if argv.len() < 2 {
+        return argv;
+    }
+    let first = argv[1].to_string_lossy();
+    if first.starts_with('-') {
+        // Top-level flag like --help / --version — let clap handle it.
+        return argv;
+    }
+    if SUBCOMMAND_NAMES.contains(&first.as_ref()) {
+        return argv;
+    }
+    argv.insert(1, std::ffi::OsString::from("stream"));
+    argv
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn implicit_stream_bare_file() {
+        let in_ = vec!["shuflr".into(), "data.jsonl".into()];
+        let out = rewrite_implicit_stream(in_);
+        assert_eq!(
+            out,
+            vec!["shuflr", "stream", "data.jsonl"]
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn explicit_subcommand_preserved() {
+        let in_ = vec!["shuflr".into(), "verify".into(), "x.jsonl".into()];
+        let out = rewrite_implicit_stream(in_.clone());
+        assert_eq!(out, in_);
+    }
+
+    #[test]
+    fn top_level_flag_preserved() {
+        let in_ = vec!["shuflr".into(), "--version".into()];
+        let out = rewrite_implicit_stream(in_.clone());
+        assert_eq!(out, in_);
+    }
+
+    #[test]
+    fn parse_bytes_variants() {
+        assert_eq!(parse_bytes("1024").unwrap(), 1024);
+        assert_eq!(parse_bytes("16KiB").unwrap(), 16 << 10);
+        assert_eq!(parse_bytes("2MiB").unwrap(), 2 << 20);
+        assert_eq!(parse_bytes("1GB").unwrap(), 1_000_000_000);
+        assert_eq!(
+            parse_bytes("1.5MiB").unwrap(),
+            (1.5 * (1 << 20) as f64) as u64
+        );
+        assert!(parse_bytes("2zz").is_err());
+    }
+}

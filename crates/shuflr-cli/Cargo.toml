@@ -16,20 +16,30 @@ name = "shuflr"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["zstd", "gzip"]
 grpc = ["shuflr/grpc"]
 prom = ["shuflr/prom"]
 otlp = ["shuflr/otlp"]
 uring = ["shuflr/uring"]
 zstd = ["shuflr/zstd"]
 gzip = ["shuflr/gzip"]
+bzip2 = ["shuflr/bzip2"]
+xz = ["shuflr/xz"]
 s3 = ["shuflr/s3"]
 gcs = ["shuflr/gcs"]
 sandbox = ["shuflr/sandbox"]
 # Canonical build presets.
 serve = ["grpc", "prom"]
-full = ["serve", "otlp", "uring", "zstd", "gzip", "s3", "gcs", "sandbox"]
+full = ["serve", "otlp", "uring", "zstd", "gzip", "bzip2", "xz", "s3", "gcs", "sandbox"]
 
 [dependencies]
 shuflr = { path = "../shuflr" }
 anyhow = "1"
+clap = { version = "4", features = ["derive", "env", "wrap_help", "color"] }
+clap_complete = "4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
