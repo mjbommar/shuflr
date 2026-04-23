@@ -1,18 +1,24 @@
 //! Rust core for the `shuflr-client` Python package.
 //!
-//! PR-34a scope: HTTP transport only. The `Dataset` class wraps a
-//! blocking HTTP/1.1 NDJSON connection to a `shuflr serve` endpoint;
-//! `__iter__` returns raw `bytes` records, one per `__next__` call,
-//! terminating on server close or `--sample` exhaustion.
+//! Transports as of PR-34b:
 //!
-//! The PR-36 follow-up adds the custom `shuflr-wire/1` binary transport
-//! and negotiates between the two based on URL scheme. Until then,
-//! schemes `shuflr://` / `shuflrs://` are accepted for forward
-//! compatibility but raise `NotImplementedError`.
+//!   http://host:port/v1/streams/{id}    — HTTP/1.1 NDJSON (ureq)
+//!   https:// …                          — same, TLS (ureq's TLS feature)
+//!   shuflr://host:port/{dataset_id}     — shuflr-wire/1 over plain TCP
+//!
+//! `shuflrs://` (wire + TLS) and `shuflr+unix://` (wire + UDS) parse
+//! successfully for forward compat but currently raise
+//! NotImplementedError from `__iter__` — follow-up PRs add rustls and
+//! AF_UNIX support.
+//!
+//! Everything is blocking — we deliberately avoid tokio in the Python
+//! wheel. PyTorch's multiprocessing DataLoader fork-spawns workers,
+//! and carrying an async runtime across fork is a nightmare.
 
 #![allow(clippy::unwrap_used)]
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::ToSocketAddrs;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -81,10 +87,12 @@ fn parse_target(url_str: &str) -> PyResult<Target> {
     })
 }
 
-/// Iterator over records. Holds the underlying BufReader and yields
-/// `bytes` line by line (without the trailing `\n`).
+/// Iterator over records. Each variant handles one transport's
+/// framing / decoding; the Python-facing `Dataset::__next__` dispatches
+/// on the active variant.
 enum Stream {
     Http(HttpStream),
+    Wire(WireStream),
 }
 
 struct HttpStream {
@@ -129,6 +137,103 @@ impl HttpStream {
             return Some(Err(PyIOError::new_err(format!("server error: {msg}"))));
         }
         Some(Ok(line))
+    }
+}
+
+/// Blocking `shuflr-wire/1` client state. Owns the TCP socket, the
+/// decoder buffer, and a queue of already-decoded records waiting to
+/// be handed to Python.
+struct WireStream {
+    /// Underlying connection. Boxed so we can switch between plain
+    /// TCP (and, later, TLS) without leaking that shape through the
+    /// enum.
+    conn: Box<dyn ReadWrite + Send>,
+    decoder: shuflr_wire::Decoder,
+    pending: std::collections::VecDeque<Vec<u8>>,
+    scratch: Vec<u8>,
+    exhausted: bool,
+}
+
+trait ReadWrite: Read + std::io::Write {}
+impl<T: Read + std::io::Write> ReadWrite for T {}
+
+impl WireStream {
+    fn next_record(&mut self) -> Option<PyResult<Vec<u8>>> {
+        loop {
+            if let Some(rec) = self.pending.pop_front() {
+                return Some(Ok(rec));
+            }
+            if self.exhausted {
+                return None;
+            }
+            // Drain any already-buffered frames first.
+            match self.decoder.try_next() {
+                Ok(Some(msg)) => {
+                    if let Some(err) = self.handle_server_message(msg) {
+                        return Some(Err(err));
+                    }
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    self.exhausted = true;
+                    return Some(Err(PyIOError::new_err(format!("wire decode: {e}"))));
+                }
+            }
+            // Need more bytes.
+            match self.conn.read(&mut self.scratch) {
+                Ok(0) => {
+                    self.exhausted = true;
+                    if self.pending.is_empty() {
+                        return None;
+                    }
+                    continue;
+                }
+                Ok(n) => self.decoder.feed(&self.scratch[..n]),
+                Err(e) => {
+                    self.exhausted = true;
+                    return Some(Err(PyIOError::new_err(format!("wire read: {e}"))));
+                }
+            }
+        }
+    }
+
+    /// Handle one decoded server-side message. Returns `Some(err)` if
+    /// the caller should surface a Python error; `None` to keep
+    /// looping.
+    fn handle_server_message(&mut self, msg: shuflr_wire::Message) -> Option<pyo3::PyErr> {
+        use shuflr_wire::Message;
+        let kind = msg.kind();
+        match msg {
+            Message::PlainBatch(batch) => {
+                self.pending.extend(batch.records);
+                None
+            }
+            Message::EpochBoundary { .. } | Message::Heartbeat { .. } => None,
+            Message::StreamClosed { .. } => {
+                self.exhausted = true;
+                None
+            }
+            Message::StreamError {
+                code,
+                fatal,
+                detail,
+            } => {
+                self.exhausted = true;
+                let detail = String::from_utf8_lossy(&detail).into_owned();
+                Some(PyIOError::new_err(format!(
+                    "server StreamError code={code:?} fatal={fatal} detail={detail}"
+                )))
+            }
+            // The server shouldn't send these to a client; treat as a
+            // protocol violation but drain cleanly rather than panic.
+            _ => {
+                self.exhausted = true;
+                Some(PyIOError::new_err(format!(
+                    "unexpected server message kind={kind:?}"
+                )))
+            }
+        }
     }
 }
 
@@ -203,11 +308,12 @@ impl Dataset {
             slf.open_stream()?;
         }
         let py = slf.py();
-        let line = match &mut slf.stream {
+        let rec = match &mut slf.stream {
             Some(Stream::Http(s)) => s.next_line(),
+            Some(Stream::Wire(s)) => s.next_record(),
             None => None,
         };
-        match line {
+        match rec {
             Some(Ok(bytes)) => Ok(PyBytes::new(py, &bytes).into()),
             Some(Err(e)) => Err(e),
             None => Err(PyStopIteration::new_err(())),
@@ -252,11 +358,23 @@ impl Dataset {
                 self.stream = Some(Stream::Http(stream));
                 Ok(())
             }
-            Transport::WireTcp | Transport::WireTls | Transport::WireUnix => {
-                Err(PyNotImplementedError::new_err(
-                    "shuflr-wire/1 transport lands in PR-36; use http:// or https:// for now",
-                ))
+            Transport::WireTcp => {
+                let stream = open_wire_tcp(
+                    &self.target.raw,
+                    &self.target.dataset_id,
+                    self.seed,
+                    &self.shuffle,
+                    self.sample,
+                    self.rank,
+                    self.world_size,
+                    self.timeout_secs,
+                )?;
+                self.stream = Some(Stream::Wire(stream));
+                Ok(())
             }
+            Transport::WireTls | Transport::WireUnix => Err(PyNotImplementedError::new_err(
+                "shuflrs:// and shuflr+unix:// ship in a follow-up; use shuflr:// for now",
+            )),
         }
     }
 }
@@ -316,6 +434,135 @@ fn open_http(
     let reader: Box<dyn Read + Send> = Box::new(resp.into_reader());
     Ok(HttpStream {
         reader: Mutex::new(BufReader::with_capacity(256 * 1024, reader)),
+        exhausted: false,
+    })
+}
+
+/// OpenStream payload — mirrors the server's `serve::wire::OpenStreamJson`.
+/// Kept in sync by shared field names; PR-35 will swap both for proto.
+#[derive(serde::Serialize)]
+struct OpenStreamJson<'a> {
+    dataset_id: &'a str,
+    seed: u64,
+    shuffle: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sample: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rank: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    world_size: Option<u32>,
+    max_batch_records: u32,
+}
+
+/// Open a `shuflr://host:port/{dataset}` connection: plain TCP, no
+/// auth, no TLS. `shuflrs://` (TLS) and `shuflr+unix://` (UDS) come
+/// in follow-up PRs — the URL parser already accepts them but
+/// `open_stream` rejects them with `NotImplementedError`.
+#[allow(clippy::too_many_arguments)]
+fn open_wire_tcp(
+    url_str: &str,
+    dataset_id: &str,
+    seed: u64,
+    shuffle: &str,
+    sample: Option<u64>,
+    rank: Option<u32>,
+    world_size: Option<u32>,
+    timeout_secs: f64,
+) -> PyResult<WireStream> {
+    use shuflr_wire::{
+        AuthKind, ClientHello, DecodeOptions, Decoder, HandshakeRole, HandshakeStatus, Message,
+        encode,
+    };
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let parsed = url::Url::parse(url_str)
+        .map_err(|e| PyValueError::new_err(format!("invalid URL '{url_str}': {e}")))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| PyValueError::new_err(format!("URL '{url_str}' has no host")))?;
+    let port = parsed
+        .port()
+        .ok_or_else(|| PyValueError::new_err(format!("URL '{url_str}' has no port")))?;
+
+    // Connect with the requested handshake timeout.
+    let connect_timeout = Duration::from_secs_f64(timeout_secs.max(0.1));
+    let socket_addrs: Vec<std::net::SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| PyIOError::new_err(format!("resolve {host}:{port}: {e}")))?
+        .collect();
+    let first = socket_addrs
+        .first()
+        .copied()
+        .ok_or_else(|| PyIOError::new_err(format!("no addresses for {host}:{port}")))?;
+    let mut tcp = TcpStream::connect_timeout(&first, connect_timeout)
+        .map_err(|e| PyIOError::new_err(format!("connect {first}: {e}")))?;
+    // Per-read/write timeout is separate; leave it None so a long
+    // stream doesn't artificially time out mid-fetch.
+    tcp.set_nodelay(true).ok();
+
+    // Build and send the ClientHello.
+    let open = OpenStreamJson {
+        dataset_id,
+        seed,
+        shuffle,
+        sample,
+        rank,
+        world_size,
+        max_batch_records: 64,
+    };
+    let open_json = serde_json::to_vec(&open)
+        .map_err(|e| PyIOError::new_err(format!("encode OpenStream: {e}")))?;
+    let hello = Message::ClientHello(ClientHello {
+        capability_flags: 0b111,
+        auth_kind: AuthKind::None,
+        auth: Vec::new(),
+        open_stream: open_json,
+    });
+    let encoded = encode(&hello);
+    tcp.write_all(&encoded)
+        .map_err(|e| PyIOError::new_err(format!("wire send hello: {e}")))?;
+
+    // Read the ServerHello.
+    let mut decoder = Decoder::new(DecodeOptions {
+        role: HandshakeRole::ExpectServerHello,
+        ..Default::default()
+    });
+    let mut scratch = vec![0u8; 64 * 1024];
+    let server_hello = loop {
+        match decoder.try_next() {
+            Ok(Some(Message::ServerHello(h))) => break h,
+            Ok(Some(other)) => {
+                return Err(PyIOError::new_err(format!(
+                    "expected ServerHello first, got {:?}",
+                    other.kind()
+                )));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Err(PyIOError::new_err(format!("wire decode hello: {e}")));
+            }
+        }
+        let n = tcp
+            .read(&mut scratch)
+            .map_err(|e| PyIOError::new_err(format!("wire read hello: {e}")))?;
+        if n == 0 {
+            return Err(PyIOError::new_err("connection closed before ServerHello"));
+        }
+        decoder.feed(&scratch[..n]);
+    };
+    if server_hello.status != HandshakeStatus::Ok {
+        let detail = String::from_utf8_lossy(&server_hello.stream_opened).into_owned();
+        return Err(PyIOError::new_err(format!(
+            "server rejected handshake: {detail}"
+        )));
+    }
+
+    Ok(WireStream {
+        conn: Box::new(tcp),
+        decoder,
+        pending: std::collections::VecDeque::new(),
+        scratch,
         exhausted: false,
     })
 }

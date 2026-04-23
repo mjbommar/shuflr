@@ -28,6 +28,13 @@ pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
 ureq = { version = "2", default-features = false, features = ["gzip"] }
 url = "2"
 thiserror = "2"
+# Binary wire transport (005 §2.2). Pulls in only codec + thiserror
+# + xxh3 — no tokio, no TLS — so the wheel stays lean.
+shuflr-wire = { path = "../shuflr-wire" }
+# JSON (de)serialization for OpenStream / StreamOpened payloads.
+# Lives inside the codec's opaque bytes; server uses the same crate.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 # Spawn a real server binary in integration tests.

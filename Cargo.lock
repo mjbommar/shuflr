@@ -3483,7 +3483,10 @@ name = "shuflr-client"
 version = "0.0.0"
 dependencies = [
  "pyo3",
+ "serde",
+ "serde_json",
  "shuflr",
+ "shuflr-wire",
  "tempfile",
  "thiserror 2.0.18",
  "ureq",

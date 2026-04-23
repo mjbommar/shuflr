@@ -47,18 +47,19 @@ Each DataLoader worker opens its own stream with a distinct
 
 ## Transports
 
-| Scheme | Transport | Available in |
+| Scheme | Transport | Status |
 |---|---|---|
-| `http://` | Plain HTTP/1.1 chunked NDJSON | **PR-34a (now)** |
-| `https://` | HTTPS (rustls) | PR-34a |
-| `shuflr://` | Custom binary, TCP | PR-36 |
-| `shuflrs://` | Custom binary, TLS | PR-36 |
-| `shuflr+unix://` | Custom binary, UDS | PR-36 |
+| `http://` | Plain HTTP/1.1 chunked NDJSON | shipped (PR-34a) |
+| `https://` | HTTPS (ureq TLS) | shipped (PR-34a) |
+| `shuflr://` | `shuflr-wire/1` over plain TCP | **shipped (PR-34b)** |
+| `shuflrs://` | `shuflr-wire/1` over TLS | parses, not yet wired |
+| `shuflr+unix://` | `shuflr-wire/1` over UDS | parses, not yet wired |
 
 The HTTP transport is the universal fallback — works through any proxy,
-every firewall, every LB. The custom `shuflr-wire/1` transport will
-add ~6× wire-size savings on `chunk-shuffled` via compressed-frame
-passthrough (005 §3.5).
+every firewall, every LB. The `shuflr-wire/1` transport adds explicit
+framing and ordered delivery beyond what TCP gives you; when raw-frame
+passthrough lands (PR-33b), `chunk-shuffled` streams shrink to ~disk
+size on the wire (~6× vs NDJSON).
 
 ## Development
 

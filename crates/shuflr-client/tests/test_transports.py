@@ -55,51 +55,83 @@ def _free_port() -> int:
     return port
 
 
+def _spawn_serve(
+    datasets: dict[str, Path],
+    transport: str = "http",
+    extra: list[str] | None = None,
+) -> dict:
+    """Spawn `shuflr serve` with the requested transport, wait for
+    ready, and return {'port', 'proc', 'base'}. Reader thread stays
+    running to keep stderr drained (otherwise the pipe fills and the
+    server blocks on its next log write — see PR-33 commit message)."""
+    port = _free_port()
+    listener_flag = {
+        "http": "--http",
+        "wire": "--wire",
+    }[transport]
+    args = [
+        str(_find_shuflr_bin()),
+        "serve",
+        listener_flag,
+        f"127.0.0.1:{port}",
+        "--log-level",
+        "info",
+    ]
+    for name, path in datasets.items():
+        args.extend(["--dataset", f"{name}={path}"])
+    if extra:
+        args.extend(extra)
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=1,
+        text=True,
+    )
+
+    ready_marker = f"serve({transport}) bound"
+    deadline = time.time() + 10.0
+    ready = False
+    # Drain stderr continuously in a background thread; only the ready
+    # marker unblocks us.
+    import threading
+
+    ready_evt = threading.Event()
+
+    def _drain():
+        for line in proc.stderr:
+            sys.stderr.write(f"[serve-{transport}] {line}")
+            if ready_marker in line:
+                ready_evt.set()
+
+    threading.Thread(target=_drain, daemon=True).start()
+    while time.time() < deadline:
+        if ready_evt.wait(timeout=0.05):
+            ready = True
+            break
+        if proc.poll() is not None:
+            raise RuntimeError(f"shuflr serve exited early (rc={proc.returncode})")
+    if not ready:
+        proc.kill()
+        raise RuntimeError(f"shuflr serve never logged '{ready_marker}' in time")
+
+    base = {
+        "http": f"http://127.0.0.1:{port}",
+        "wire": f"shuflr://127.0.0.1:{port}",
+    }[transport]
+    return {"port": port, "proc": proc, "base": base}
+
+
 @pytest.fixture
 def serve_factory(tmp_path):
-    """Factory that spawns `shuflr serve` and tears it down cleanly."""
+    """Spawn one or more `shuflr serve` instances; tear them down
+    cleanly at test end."""
     procs = []
 
-    def spawn(datasets: dict[str, Path]) -> dict:
-        port = _free_port()
-        args = [
-            str(_find_shuflr_bin()),
-            "serve",
-            "--http",
-            f"127.0.0.1:{port}",
-            "--log-level",
-            "info",
-        ]
-        for name, path in datasets.items():
-            args.extend(["--dataset", f"{name}={path}"])
-        proc = subprocess.Popen(
-            args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=1,
-            text=True,
-        )
-        procs.append(proc)
-
-        # Wait for "serve(http) bound" on stderr.
-        deadline = time.time() + 10.0
-        while time.time() < deadline:
-            line = proc.stderr.readline()
-            if not line:
-                rc = proc.poll()
-                if rc is not None:
-                    raise RuntimeError(
-                        f"shuflr serve exited with {rc} before ready"
-                    )
-                continue
-            sys.stderr.write(f"[serve] {line}")
-            if "serve(http) bound" in line:
-                break
-        else:
-            proc.kill()
-            raise RuntimeError("shuflr serve never printed 'bound' in time")
-
-        return {"port": port, "proc": proc, "base": f"http://127.0.0.1:{port}"}
+    def spawn(datasets: dict[str, Path], transport: str = "http", extra=None) -> dict:
+        info = _spawn_serve(datasets, transport=transport, extra=extra)
+        procs.append(info["proc"])
+        return info
 
     yield spawn
 
@@ -153,13 +185,12 @@ def test_transport_property():
     assert ds_s.transport == "https"
 
 
-def test_wire_transport_raises_not_implemented():
-    ds = shuflr_client.Dataset("shuflr://host:9000/corpus")
-    assert ds.transport == "shuflr-wire/1"
-    # We only see NotImplementedError on iteration, because construction
-    # is lazy / URL-only.
-    with pytest.raises(NotImplementedError):
-        list(ds)
+def test_wire_tls_and_unix_raise_not_implemented():
+    """shuflrs:// (TLS) and shuflr+unix:// (UDS) parse but aren't wired yet."""
+    for url in ("shuflrs://host:9000/corpus", "shuflr+unix:///tmp/sock/corpus"):
+        ds = shuflr_client.Dataset(url)
+        with pytest.raises(NotImplementedError):
+            list(ds)
 
 
 def test_unknown_scheme_rejected():
@@ -240,3 +271,48 @@ def test_bearer_token_missing_raises(serve_factory, tmp_path):
         except _sp.TimeoutExpired:
             proc.kill()
             proc.wait()
+
+
+# ---------------- shuflr-wire/1 (PR-34b) ----------------
+
+
+def test_wire_dataset_iterates_records(serve_factory, tmp_path):
+    """Bare shuflr://host:port/{dataset} end-to-end through the Rust
+    wire client against a real `shuflr serve --wire` subprocess."""
+    ds_path = tmp_path / "c.jsonl"
+    records = [f'{{"i":{i:03d}}}' for i in range(40)]
+    ds_path.write_text("\n".join(records) + "\n")
+    server = serve_factory({"c": ds_path}, transport="wire")
+
+    ds = shuflr_client.Dataset(
+        f"{server['base']}/c",
+        seed=7,
+        shuffle="buffer",
+    )
+    assert ds.transport == "shuflr-wire/1"
+    got = [r.decode() for r in ds]
+    assert sorted(got) == sorted(records)
+
+
+def test_wire_dataset_respects_sample(serve_factory, tmp_path):
+    ds_path = tmp_path / "c.jsonl"
+    ds_path.write_text("\n".join(f"r{i:03d}" for i in range(500)) + "\n")
+    server = serve_factory({"c": ds_path}, transport="wire")
+
+    ds = shuflr_client.Dataset(
+        f"{server['base']}/c",
+        seed=1,
+        shuffle="none",
+        sample=23,
+    )
+    got = list(ds)
+    assert len(got) == 23
+
+
+def test_wire_rejects_unknown_dataset(serve_factory, tmp_path):
+    ds_path = tmp_path / "c.jsonl"
+    ds_path.write_text("x\n")
+    server = serve_factory({"real": ds_path}, transport="wire")
+    ds = shuflr_client.Dataset(f"{server['base']}/missing")
+    with pytest.raises(OSError):
+        list(ds)
