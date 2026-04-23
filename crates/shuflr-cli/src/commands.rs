@@ -139,14 +139,124 @@ pub fn stream_dispatch(args: cli::StreamArgs) -> exit::Code {
             Ok(()) => exit::Code::Ok,
             Err(e) => report_library_error(&e),
         },
+        #[cfg(feature = "zstd")]
+        cli::ShuffleMode::ChunkShuffled => match stream_chunk_shuffled_inner(args) {
+            Ok(()) => exit::Code::Ok,
+            Err(e) => report_library_error(&e),
+        },
         other => stub(
             "stream",
             format!(
                 "--shuffle={other:?} is not yet implemented. Supported modes so far: \
-                 none, buffer. See docs/design/002 §2 and 004 §9 for the roadmap."
+                 none, buffer, chunk-shuffled (seekable .zst only). See docs/design/002 \
+                 §2 and 004 §9 for the roadmap."
             ),
         ),
     }
+}
+
+#[cfg(feature = "zstd")]
+fn stream_chunk_shuffled_inner(args: cli::StreamArgs) -> shuflr::Result<()> {
+    if args.input.inputs.len() != 1 {
+        return Err(shuflr::Error::Input(
+            "--shuffle=chunk-shuffled currently takes exactly one seekable-zstd input. \
+             Multi-input and weighted-mix support land with PR-8."
+                .into(),
+        ));
+    }
+    let path = &args.input.inputs[0];
+    if path == std::path::Path::new("-") {
+        return Err(shuflr::Error::Input(
+            "--shuffle=chunk-shuffled requires a seekable file; stdin is not seekable. \
+             Either save your stream to disk and re-invoke, or use --shuffle=buffer:K."
+                .into(),
+        ));
+    }
+
+    // Reader rejects non-seekable inputs with a clear error.
+    let reader = shuflr::io::zstd_seekable::SeekableReader::open(path).map_err(|e| {
+        match e {
+            // Wrap unhelpful Io errors with a user-friendly message.
+            shuflr::Error::Io(io_err) => shuflr::Error::Input(format!(
+                "'{}' is not a seekable-zstd file ({io_err}). \
+                 Run `shuflr convert {}` first, or use --shuffle=buffer:K.",
+                path.display(),
+                path.display(),
+            )),
+            other => other,
+        }
+    })?;
+
+    let seed = args.seed.unwrap_or(0);
+    if args.seed.is_none() {
+        tracing::info!(seed, "no --seed given; using default");
+    }
+    tracing::info!(
+        path = %path.display(),
+        frames = reader.num_frames(),
+        total_decompressed = reader.total_decompressed(),
+        seed,
+        epochs = args.epochs,
+        "opened seekable input (chunk-shuffled)",
+    );
+
+    let stdout = io::stdout();
+    let mut sink = stdout.lock();
+    let mut total = shuflr::Stats::default();
+    let epochs_cap = if args.epochs == 0 {
+        u64::MAX
+    } else {
+        args.epochs
+    };
+    let total_start = Instant::now();
+
+    for epoch in 0..epochs_cap {
+        // Reopen reader each epoch so we get a fresh file-position state.
+        // (The reader can be reused; the CLI keeps it simple.)
+        let reader = shuflr::io::zstd_seekable::SeekableReader::open(path).map_err(|e| {
+            shuflr::Error::Input(format!(
+                "reopening '{}' for epoch {epoch}: {e}",
+                path.display()
+            ))
+        })?;
+        let cfg = shuflr::pipeline::ChunkShuffledConfig {
+            seed,
+            epoch,
+            max_line: args.max_line,
+            on_error: args.on_error.into(),
+            sample: remaining_sample(args.sample, &total),
+            ensure_trailing_newline: true,
+        };
+        let started = Instant::now();
+        let stats = shuflr::pipeline::chunk_shuffled(reader, &mut sink, &cfg)?;
+        let elapsed = started.elapsed();
+        tracing::info!(
+            epoch,
+            records_in = stats.records_in,
+            records_out = stats.records_out,
+            bytes_in = stats.bytes_in,
+            bytes_out = stats.bytes_out,
+            throughput_mb_s = mbs(stats.bytes_in, elapsed),
+            elapsed_ms = elapsed.as_millis() as u64,
+            "chunk-shuffled epoch done",
+        );
+        accumulate(&mut total, &stats);
+        if let Some(cap) = args.sample
+            && total.records_out >= cap
+        {
+            break;
+        }
+    }
+
+    let elapsed = total_start.elapsed();
+    tracing::info!(
+        records_out = total.records_out,
+        throughput_mb_s = mbs(total.bytes_in, elapsed),
+        elapsed_ms = elapsed.as_millis() as u64,
+        "chunk-shuffled done",
+    );
+    sink.flush().map_err(shuflr::Error::Io)?;
+    Ok(())
 }
 
 fn stream_buffer_inner(args: cli::StreamArgs) -> shuflr::Result<()> {

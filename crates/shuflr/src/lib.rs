@@ -9,6 +9,8 @@ pub mod error;
 pub mod framing;
 pub mod io;
 pub mod pipeline;
+pub mod seed;
 
 pub use error::{Error, Result};
 pub use framing::{OnError, Stats};
+pub use seed::Seed;

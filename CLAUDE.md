@@ -80,7 +80,7 @@ Two crates, not four. The library `shuflr` contains all engine modules (`shuffle
 
 ## Current status
 
-Through PR-5: CLI dispatch, `--shuffle=none` passthrough, `--shuffle=buffer:K` local shuffle, transparent streaming decompression for `.gz` / `.zst` / `.bz2` / `.xz`, and `shuflr convert` → record-aligned zstd-seekable output (trailing seek table per Facebook's spec, median frame 2.09 MiB on real EDGAR records). `shuflr info` reads the seek table in < 10 ms. Buffer shuffle is deterministic by `--seed`, emits every record exactly once, preserves multisets, and runs at 829 MB/s on zstd-decoded EDGAR records. 76 tests green. Next: PR-6 — seekable-zstd reader and chunk-shuffled on `.zst` (the "convert once, shuffle forever" payoff).
+Through PR-6: CLI dispatch, `--shuffle={none,buffer:K,chunk-shuffled}`, transparent streaming decompression for `.gz` / `.zst` / `.bz2` / `.xz`, and `shuflr convert` → record-aligned zstd-seekable output. `shuflr info` reads seek tables in < 10 ms. The "convert once, shuffle forever" loop works end-to-end: convert EDGAR `.zst` into 2348 record-aligned frames (median 2.09 MiB), then `shuflr stream --shuffle=chunk-shuffled` samples from them in O(1) time at ~1 GB/s, deterministic by `--seed`. PRF hierarchy (seed.rs, BLAKE3-derived sub-seeds for epoch/perm/frame) drives addressable determinism — same seed + different epoch yields a different order without RNG replay. 88 tests green (51 lib unit + 3 lib integration + 5 CLI unit + 29 CLI integration). Next: PR-7 — multithreaded `shuflr convert` + `--verify` (makes convert fast), or PR-8 — `index-perm` provably-uniform shuffle.
 
 ## Upstream
 

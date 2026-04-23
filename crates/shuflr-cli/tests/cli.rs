@@ -40,23 +40,25 @@ fn version_flag_emits_a_version() {
 
 #[test]
 fn implicit_stream_dispatch_on_bare_path() {
-    // A path-like positional with no subcommand should route to `stream`,
-    // which in PR-1 is stubbed. Exit code 69 (EX_UNAVAILABLE) is how we
-    // identify a stubbed-but-not-yet-implemented subcommand.
+    // Implicit stream + default chunk-shuffled mode. On a nonexistent path
+    // the reader reports EX_NOINPUT via the typed NotFound variant.
     shuflr()
         .arg("nonexistent-file.jsonl")
         .assert()
-        .code(69)
-        .stderr(predicate::str::contains("'stream' is not yet implemented"));
+        .code(66) // EX_NOINPUT
+        .stderr(predicate::str::contains("no such file"));
 }
 
 #[test]
-fn explicit_stream_subcommand_also_stubbed() {
+fn explicit_stream_with_stdin_rejects_chunk_shuffled() {
+    // Default mode is chunk-shuffled. stdin isn't seekable, so the chunk
+    // handler refuses with a clear EX_USAGE, nudging toward --shuffle=buffer.
     shuflr()
         .args(["stream", "-"])
+        .write_stdin("one\ntwo\n")
         .assert()
-        .code(69)
-        .stderr(predicate::str::contains("'stream' is not yet implemented"));
+        .code(64) // EX_USAGE
+        .stderr(predicate::str::contains("--shuffle=buffer"));
 }
 
 #[test]
@@ -146,13 +148,92 @@ fn stream_none_roundtrips_tiny_fixture() {
 }
 
 #[test]
-fn implicit_stream_still_errors_on_default_mode_stub() {
-    // Default --shuffle is chunk-shuffled which is stubbed; user gets a clear message.
+fn implicit_stream_on_plain_file_with_default_mode_points_user_to_convert() {
+    // Default mode is chunk-shuffled which (in PR-6) works only on seekable
+    // zstd files. A plain-JSONL file gets an EX_USAGE with a `shuflr convert`
+    // suggestion — the canonical "convert once, shuffle forever" onramp.
     shuflr()
         .arg(tiny_corpus())
         .assert()
-        .code(69)
-        .stderr(predicate::str::contains("not yet implemented"));
+        .code(64)
+        .stderr(predicate::str::contains("shuflr convert"));
+}
+
+#[test]
+fn chunk_shuffled_on_seekable_zstd_works_end_to_end() {
+    use std::collections::BTreeSet;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let in_path = tmp.path().join("in.jsonl");
+    let seekable_path = tmp.path().join("in.jsonl.zst");
+
+    let records: Vec<String> = (0..500).map(|i| format!("{{\"i\":{i}}}\n")).collect();
+    std::fs::write(&in_path, records.concat()).unwrap();
+
+    // convert → seekable zstd
+    shuflr()
+        .args(["convert", "--log-level", "warn", "-o"])
+        .arg(&seekable_path)
+        .arg(&in_path)
+        .assert()
+        .success();
+
+    // chunk-shuffled stream of the seekable file
+    let assert_a = shuflr()
+        .args([
+            "stream",
+            "--shuffle",
+            "chunk-shuffled",
+            "--seed",
+            "7",
+            "--log-level",
+            "warn",
+        ])
+        .arg(&seekable_path)
+        .assert()
+        .success();
+    let out_a = String::from_utf8(assert_a.get_output().stdout.clone()).unwrap();
+
+    // Same seed: byte-identical.
+    let assert_b = shuflr()
+        .args([
+            "stream",
+            "--shuffle",
+            "chunk-shuffled",
+            "--seed",
+            "7",
+            "--log-level",
+            "warn",
+        ])
+        .arg(&seekable_path)
+        .assert()
+        .success();
+    let out_b = String::from_utf8(assert_b.get_output().stdout.clone()).unwrap();
+    assert_eq!(out_a, out_b, "same seed must give byte-identical output");
+
+    // Different seed: different order; same multiset.
+    let assert_c = shuflr()
+        .args([
+            "stream",
+            "--shuffle",
+            "chunk-shuffled",
+            "--seed",
+            "8",
+            "--log-level",
+            "warn",
+        ])
+        .arg(&seekable_path)
+        .assert()
+        .success();
+    let out_c = String::from_utf8(assert_c.get_output().stdout.clone()).unwrap();
+    assert_ne!(out_a, out_c);
+
+    let in_set: BTreeSet<&str> = records.iter().map(|s| s.trim_end()).collect();
+    let out_set: BTreeSet<&str> = out_a.lines().collect();
+    assert_eq!(in_set, out_set, "multiset preserved under shuffle");
+
+    // And the order actually changed vs. the original file.
+    assert_ne!(out_a, records.concat());
 }
 
 #[test]
