@@ -80,7 +80,7 @@ Two crates, not four. The library `shuflr` contains all engine modules (`shuffle
 
 ## Current status
 
-Through PR-6: CLI dispatch, `--shuffle={none,buffer:K,chunk-shuffled}`, transparent streaming decompression for `.gz` / `.zst` / `.bz2` / `.xz`, and `shuflr convert` → record-aligned zstd-seekable output. `shuflr info` reads seek tables in < 10 ms. The "convert once, shuffle forever" loop works end-to-end: convert EDGAR `.zst` into 2348 record-aligned frames (median 2.09 MiB), then `shuflr stream --shuffle=chunk-shuffled` samples from them in O(1) time at ~1 GB/s, deterministic by `--seed`. PRF hierarchy (seed.rs, BLAKE3-derived sub-seeds for epoch/perm/frame) drives addressable determinism — same seed + different epoch yields a different order without RNG replay. 88 tests green (51 lib unit + 3 lib integration + 5 CLI unit + 29 CLI integration). Next: PR-7 — multithreaded `shuflr convert` + `--verify` (makes convert fast), or PR-8 — `index-perm` provably-uniform shuffle.
+Through PR-7: CLI dispatch, `--shuffle={none,buffer:K,chunk-shuffled}`, transparent streaming decompression for `.gz` / `.zst` / `.bz2` / `.xz`, `shuflr convert` (single- or multi-threaded), `shuflr info`, and `shuflr stream --shuffle=chunk-shuffled` on seekable zstd. Multithreaded convert gives **4.56× speedup** on 16 cores (22.1 s → 4.84 s on EDGAR sample, byte-identical output via deterministic frame-id reorder). "Convert once, shuffle forever" loop works at ~1 GB/s. 92 tests green. Next candidates: PR-8 — `index-perm` provably-uniform shuffle; PR-9 — `--verify` post-write roundtrip; PR-10 — progress bar.
 
 ## Upstream
 

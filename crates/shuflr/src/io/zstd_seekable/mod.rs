@@ -4,10 +4,12 @@
 //! random-access [`SeekableReader`] (PR-6). `--shuffle=chunk-shuffled`
 //! on `.jsonl.zst` inputs is PR-6.
 
+pub mod parallel;
 pub mod reader;
 pub mod seek_table;
 pub mod writer;
 
+pub use parallel::{ParallelConfig, run as convert_parallel};
 pub use reader::SeekableReader;
 pub use seek_table::{FrameEntry, SEEKABLE_MAGIC, SKIPPABLE_MAGIC, SeekTable};
 pub use writer::{

@@ -361,7 +361,7 @@ pub fn convert(args: cli::ConvertArgs) -> exit::Code {
 
 #[cfg(feature = "zstd")]
 fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
-    use shuflr::io::zstd_seekable::{Writer, WriterConfig};
+    use shuflr::io::zstd_seekable::{ParallelConfig, Writer, WriterConfig, convert_parallel};
     use std::io::{BufReader, Read};
     use std::time::Instant;
 
@@ -381,18 +381,18 @@ fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
     })?;
 
     let input = shuflr::io::Input::open(in_path)?;
+    let effective_threads = resolve_threads(args.threads as usize);
     tracing::info!(
         path = %in_path.display(),
         raw_format = ?input.raw_format(),
         frame_size,
         level = args.level,
+        threads = effective_threads,
         record_aligned = !args.no_record_align,
         checksums = !args.no_checksum,
         "opened input for convert",
     );
 
-    // Open the output sink. Not Send-bounded because convert is
-    // single-threaded in PR-4; multithreaded compress lands in PR-5.
     let output: Box<dyn std::io::Write> = if args.output == std::path::Path::new("-") {
         Box::new(std::io::stdout().lock())
     } else {
@@ -400,25 +400,37 @@ fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
         Box::new(file)
     };
 
-    let cfg = WriterConfig {
-        level: args.level as i32,
-        frame_size,
-        checksums: !args.no_checksum,
-        record_aligned: !args.no_record_align,
-    };
-    let mut writer = Writer::new(output, cfg);
-
     let started = Instant::now();
-    let mut reader = BufReader::with_capacity(2 * 1024 * 1024, input);
-    let mut buf = vec![0u8; 2 * 1024 * 1024];
-    loop {
-        let n = reader.read(&mut buf).map_err(shuflr::Error::Io)?;
-        if n == 0 {
-            break;
+    let stats = if effective_threads <= 1 {
+        // Single-threaded path: simple Writer API.
+        let cfg = WriterConfig {
+            level: args.level as i32,
+            frame_size,
+            checksums: !args.no_checksum,
+            record_aligned: !args.no_record_align,
+        };
+        let mut writer = Writer::new(output, cfg);
+        let mut reader = BufReader::with_capacity(2 * 1024 * 1024, input);
+        let mut buf = vec![0u8; 2 * 1024 * 1024];
+        loop {
+            let n = reader.read(&mut buf).map_err(shuflr::Error::Io)?;
+            if n == 0 {
+                break;
+            }
+            writer.write_block(&buf[..n])?;
         }
-        writer.write_block(&buf[..n])?;
-    }
-    let stats = writer.finish()?;
+        writer.finish()?
+    } else {
+        // Multi-threaded path: scoped worker pool, ordered writer.
+        let cfg = ParallelConfig {
+            level: args.level as i32,
+            frame_size,
+            checksums: !args.no_checksum,
+            record_aligned: !args.no_record_align,
+            threads: effective_threads,
+        };
+        convert_parallel(input, output, &cfg)?
+    };
     let elapsed = started.elapsed();
 
     let ratio = if stats.uncompressed_bytes > 0 {
@@ -444,6 +456,16 @@ fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
     }
 
     Ok(())
+}
+
+fn resolve_threads(requested: usize) -> usize {
+    if requested == 0 {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    } else {
+        requested
+    }
 }
 
 #[cfg(feature = "zstd")]
