@@ -27,6 +27,7 @@ For provably uniform shuffles, `--shuffle=index-perm` builds and persists a `.sh
 **Amendments (applied on top of 002):**
 - `003-compression-formats.md` — compression codec policy. Supersedes 002 §4.4; promotes streaming `.gz` / `.zst` / `.bz2` / `.xz` to v1 (buffer/none/reservoir only); partially superseded by 004.
 - `004-convert-subcommand.md` — adds `shuflr convert` + `shuflr info` subcommands (v1). Promotes the seekable-zstd writer AND reader to v1; defines record-aligned frames as a shuflr invariant. This is the canonical answer to "how do I make my corpus seekable?"
+- `005-serve-multi-transport.md` — supersedes 002 §7. Three transports (plain HTTP/1.1 NDJSON, `shuflr-wire/1` custom binary, gRPC) on a shared sync core. First-party Python client (`shuflr-client`, Rust + pyo3 + maturin) wraps them. TLS is optional; `--insecure-public` opt-in for unencrypted public bind. Auth defaults to none (bearer + mTLS available). Design only; PR-30 onward implements.
 
 When reading 002, check later-numbered docs for amendments to any section you care about. Design docs are append-only iterations (`001-`, `002-`, …). When the design evolves, write a new doc referencing the prior one; don't rewrite history.
 
@@ -84,7 +85,7 @@ Through PR-28. Highlights since PR-14: PR-15 (visible WARN on silently-dropped o
 
 **179 tests green.** Both hot-path emit modes (`chunk-shuffled` and `index-perm` on seekable-zstd) now have prefetch-pipeline parallel variants. `--emit-threads=N --emit-prefetch=K` is shared across modes; default stays `--emit-threads=1` (no behavior change without opt-in).
 
-Known follow-ups: parallel-pread reader for convert, SIGBUS handler + `--require-immutable`, `serve` gRPC subcommand (the biggest remaining piece), consistent `--log-level` across all subcommands.
+Known follow-ups: `serve` subcommand per `005-serve-multi-transport.md` (PRs 30-36: HTTP → TLS/auth → wire/1 codec → wire/1 transport → `shuflr-client` Python lib → gRPC → observability). Also: parallel-pread reader for convert, SIGBUS handler + `--require-immutable`, consistent `--log-level` across all subcommands.
 
 ## Upstream
 
