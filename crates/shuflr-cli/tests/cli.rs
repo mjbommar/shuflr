@@ -168,18 +168,60 @@ fn stream_none_honors_sample() {
 }
 
 #[test]
-fn stream_none_rejects_compressed_input_clearly() {
-    // Create a fake .gz in a tempdir with just the magic bytes — enough to trip the sniffer.
+fn stream_none_decodes_gzip_transparently() {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write as _;
+
     let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("oops.jsonl.gz");
-    std::fs::write(&path, [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0]).unwrap();
+    let path = tmp.path().join("data.jsonl.gz");
+    let mut enc = GzEncoder::new(
+        std::fs::File::create(&path).unwrap(),
+        Compression::default(),
+    );
+    enc.write_all(b"{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n").unwrap();
+    enc.finish().unwrap();
+
     shuflr()
-        .args(["stream", "--shuffle", "none"])
+        .args(["stream", "--shuffle", "none", "--log-level", "warn"])
         .arg(&path)
         .assert()
-        .code(64) // EX_USAGE
-        .stderr(predicate::str::contains("gzip"))
-        .stderr(predicate::str::contains("gunzip -c"));
+        .success()
+        .stdout("{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n");
+}
+
+#[test]
+fn stream_none_decodes_zstd_transparently() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("data.jsonl.zst");
+    let bytes = b"{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n";
+    let compressed = zstd::stream::encode_all(&bytes[..], 3).unwrap();
+    std::fs::write(&path, compressed).unwrap();
+
+    shuflr()
+        .args(["stream", "--shuffle", "none", "--log-level", "warn"])
+        .arg(&path)
+        .assert()
+        .success()
+        .stdout("{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n");
+}
+
+#[test]
+fn stream_none_decodes_gzip_via_stdin() {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write as _;
+
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(b"one\ntwo\n").unwrap();
+    let compressed = enc.finish().unwrap();
+
+    shuflr()
+        .args(["stream", "--shuffle", "none", "--log-level", "warn"])
+        .write_stdin(compressed)
+        .assert()
+        .success()
+        .stdout("one\ntwo\n");
 }
 
 #[test]

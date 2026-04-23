@@ -80,7 +80,7 @@ Two crates, not four. The library `shuflr` contains all engine modules (`shuffle
 
 ## Current status
 
-Through PR-2: CLI subcommand dispatch plus `--shuffle=none` passthrough for plain JSONL files and stdin. Compressed inputs rejected with actionable error pointing at `zstdcat` / `gunzip -c`. Criterion throughput baseline: 5.35 GiB/s on 128 MiB × 8 KiB synthetic fixture (128 MB); ~1.33 GB/s on real EDGAR corpus (zstdcat-bottlenecked). 49 tests green (23 lib unit + 3 lib integration + 4 CLI unit + 19 CLI integration). Next: PR-3 adds streaming gzip / zstd decompressors behind feature flags.
+Through PR-3: CLI dispatch, `--shuffle=none` passthrough, and transparent streaming decompression for `.gz` / `.zst` / `.bz2` / `.xz` via feature flags (`gzip` + `zstd` default-on). Auto-detect by magic bytes; `shuflr stream --shuffle=none corpus.jsonl.zst` works natively without `zstdcat`. Unsupported-feature inputs fail with a rebuild-or-pipe hint. Native zstd reading of the 1.2 GB EDGAR sample at 1.36 GB/s end-to-end, byte-identical to `zstdcat | head`. Criterion passthrough baselines still 1.10 / 4.03 / 5.35 GiB/s on plain fixtures. 51 tests green. Next: PR-4 — `shuflr convert` record-aligned seekable-zstd writer (004 §2).
 
 ## Upstream
 

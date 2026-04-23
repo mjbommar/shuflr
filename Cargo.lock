@@ -3228,11 +3228,13 @@ dependencies = [
  "assert_cmd",
  "clap",
  "clap_complete",
+ "flate2",
  "predicates",
  "shuflr",
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "zstd",
 ]
 
 [[package]]

@@ -206,12 +206,25 @@ mod tests {
         assert_eq!(out, b"ok\nWAY_TOO_LONG\nfin\n");
     }
 
+    #[cfg(feature = "gzip")]
     #[test]
-    fn rejects_gzip_input() {
-        let inp = input_of(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0]);
+    fn accepts_gzip_input_transparently() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        let original = b"one\ntwo\nthree\n";
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(original).unwrap();
+        let compressed = enc.finish().unwrap();
+
+        let inp =
+            crate::io::Input::from_reader(Box::new(std::io::Cursor::new(compressed)), None, None)
+                .unwrap();
         let mut out = Vec::new();
-        let err = run(inp, &mut out, &Config::default()).unwrap_err();
-        assert!(matches!(err, Error::CompressedInputUnsupported { .. }));
+        let stats = run(inp, &mut out, &Config::default()).unwrap();
+        assert_eq!(stats.records_in, 3);
+        assert_eq!(out, original);
     }
 
     #[test]

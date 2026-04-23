@@ -39,7 +39,7 @@ fn stream_inner(args: cli::StreamArgs) -> shuflr::Result<()> {
         tracing::info!(
             path = %path.display(),
             bytes = size_hint.unwrap_or(0),
-            format = ?input.format(),
+            format = ?input.raw_format(),
             "opened input",
         );
 
