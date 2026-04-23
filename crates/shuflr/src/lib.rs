@@ -15,6 +15,8 @@ pub mod json_validate;
 pub mod pipeline;
 pub mod sampling;
 pub mod seed;
+#[cfg(feature = "serve")]
+pub mod serve;
 
 pub use error::{Error, Result};
 pub use framing::{OnError, Stats};

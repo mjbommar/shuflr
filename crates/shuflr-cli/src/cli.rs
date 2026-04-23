@@ -45,8 +45,8 @@ pub enum Command {
     /// Stream shuffled records to stdout (default when no subcommand given)
     Stream(StreamArgs),
 
-    /// Serve shuffled records over gRPC or UDS
-    #[cfg(feature = "grpc")]
+    /// Serve shuffled records over HTTP (and, when compiled, gRPC / wire)
+    #[cfg(feature = "serve")]
     Serve(ServeArgs),
 
     /// Convert JSONL (optionally compressed) to zstd-seekable format
@@ -79,7 +79,7 @@ impl Command {
     pub fn log_level(&self) -> &str {
         match self {
             Self::Stream(a) => &a.log_level,
-            #[cfg(feature = "grpc")]
+            #[cfg(feature = "serve")]
             Self::Serve(a) => &a.log_level,
             #[cfg(feature = "zstd")]
             Self::Convert(a) => &a.log_level,
@@ -181,18 +181,26 @@ pub struct StreamArgs {
     pub log_level: String,
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "serve")]
 #[derive(Args, Debug)]
 pub struct ServeArgs {
-    /// gRPC listener address (e.g. grpc+tcp://127.0.0.1:50051 or grpc+unix:///path)
+    /// HTTP listener (e.g. `127.0.0.1:9000`). Non-loopback binds will
+    /// be rejected in PR-30 — TLS + --bind-public ship in PR-31.
     #[arg(long, value_name = "ADDR")]
-    pub grpc: String,
+    pub http: Option<String>,
 
-    /// Map dataset_id to server-local path; repeatable
+    /// gRPC listener (PR-35). Only available with --features grpc.
+    #[cfg(feature = "grpc")]
+    #[arg(long, value_name = "ADDR")]
+    pub grpc: Option<String>,
+
+    /// Map dataset_id to server-local path; repeatable.
     #[arg(long = "dataset", value_name = "ID=PATH")]
     pub datasets: Vec<String>,
 
-    /// Allow non-loopback bind (requires --tls-cert/--tls-key)
+    /// Allow non-loopback bind (requires --tls-cert/--tls-key or
+    /// --insecure-public). Not enforced in PR-30 — a non-loopback
+    /// --http address is rejected regardless. Ships in PR-31.
     #[arg(long)]
     pub bind_public: bool,
 

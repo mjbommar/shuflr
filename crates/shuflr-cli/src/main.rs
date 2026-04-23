@@ -27,7 +27,7 @@ fn main() -> ExitCode {
 
     let code = match parsed.command {
         cli::Command::Stream(a) => commands::stream_dispatch(a),
-        #[cfg(feature = "grpc")]
+        #[cfg(feature = "serve")]
         cli::Command::Serve(a) => commands::serve(a),
         #[cfg(feature = "zstd")]
         cli::Command::Convert(a) => commands::convert(a),

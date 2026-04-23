@@ -704,12 +704,60 @@ fn stream_buffer_inner(args: cli::StreamArgs) -> shuflr::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "grpc")]
-pub fn serve(_args: cli::ServeArgs) -> exit::Code {
-    stub(
-        "serve",
-        "002 §7 (shuflr.v1 proto); deferred to a post-PR-7 milestone".into(),
-    )
+#[cfg(feature = "serve")]
+pub fn serve(args: cli::ServeArgs) -> exit::Code {
+    match serve_inner(args) {
+        Ok(()) => exit::Code::Ok,
+        Err(e) => report_library_error(&e),
+    }
+}
+
+#[cfg(feature = "serve")]
+fn serve_inner(args: cli::ServeArgs) -> shuflr::Result<()> {
+    #[cfg(feature = "grpc")]
+    let grpc = args.grpc.clone();
+    #[cfg(not(feature = "grpc"))]
+    let grpc: Option<String> = None;
+
+    if args.http.is_none() && grpc.is_none() {
+        return Err(shuflr::Error::Input(
+            "`shuflr serve` needs at least one listener flag; pass --http <ADDR> \
+             (and/or --grpc <ADDR> on a grpc-enabled build)"
+                .into(),
+        ));
+    }
+    if grpc.is_some() {
+        // PR-35 wires this; reject now so we don't silently no-op.
+        return Err(shuflr::Error::Input(
+            "--grpc is reserved for PR-35; not yet wired".into(),
+        ));
+    }
+    let catalog = shuflr::serve::Catalog::from_args(&args.datasets)?;
+    let Some(http_addr_str) = args.http else {
+        unreachable!("we would have rejected no-listener above");
+    };
+    let http_addr: std::net::SocketAddr = http_addr_str.parse().map_err(|e| {
+        shuflr::Error::Input(format!("invalid --http address '{http_addr_str}': {e}"))
+    })?;
+
+    let _ = args.bind_public; // PR-31 wires this
+    let cfg = shuflr::serve::HttpConfig::new(http_addr, catalog)?;
+
+    // Spin up a multi-thread runtime. We serve arbitrarily many
+    // concurrent streams; each stream's sync-core work lives on
+    // `tokio::task::spawn_blocking`.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(shuflr::Error::Io)?;
+    rt.block_on(async move {
+        let shutdown = async {
+            // SIGINT → clean shutdown.
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("serve: SIGINT received, shutting down");
+        };
+        shuflr::serve::run_http(cfg, shutdown).await
+    })
 }
 
 #[cfg(feature = "zstd")]

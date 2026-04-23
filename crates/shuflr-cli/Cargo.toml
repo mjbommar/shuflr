@@ -17,7 +17,7 @@ path = "src/main.rs"
 
 [features]
 default = ["zstd", "gzip"]
-grpc = ["shuflr/grpc"]
+grpc = ["shuflr/grpc", "dep:tokio"]
 prom = ["shuflr/prom"]
 otlp = ["shuflr/otlp"]
 uring = ["shuflr/uring"]
@@ -28,9 +28,10 @@ xz = ["shuflr/xz"]
 s3 = ["shuflr/s3"]
 gcs = ["shuflr/gcs"]
 sandbox = ["shuflr/sandbox"]
-# Canonical build presets.
-serve = ["grpc", "prom"]
-full = ["serve", "otlp", "uring", "zstd", "gzip", "bzip2", "xz", "s3", "gcs", "sandbox"]
+# Canonical build presets. `serve` enables the HTTP transport
+# (005 §2.1). Additional transports: `grpc` adds gRPC (PR-35), etc.
+serve = ["shuflr/serve", "dep:tokio"]
+full = ["serve", "grpc", "prom", "otlp", "uring", "zstd", "gzip", "bzip2", "xz", "s3", "gcs", "sandbox"]
 
 [dependencies]
 shuflr = { path = "../shuflr" }
@@ -42,6 +43,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 indicatif = "0.17"
 memchr = "2"
+# Only pulled in when `serve` (or `grpc`) is enabled; otherwise the
+# binary has no async runtime.
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "signal"] }
 
 [dev-dependencies]
 assert_cmd = "2"
@@ -49,3 +53,5 @@ predicates = "3"
 tempfile = "3"
 flate2 = "1"
 zstd = "0.13"
+# Blocking HTTP client for serve tests. Single-crate, no tokio.
+ureq = { version = "2", default-features = false, features = ["json"] }
