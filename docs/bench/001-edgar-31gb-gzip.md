@@ -136,7 +136,7 @@ To push past 2.37 GB/s we'd need: parallel file reads (io_uring or multi-thread 
 
 The `index-perm` shuffle mode on a seekable-zstd input first builds an in-memory record index: one `(frame_id u32, offset u32, length u32)` tuple per record, 12 B each. Before PR-23 this was rebuilt every run — for the 1.2M-record EDGAR corpus that means a full 28,695-frame decode on every invocation, ~127 s of CPU.
 
-PR-23 persists that index to a `<input>.shuflr-idx-zst` sidecar, gated by a BLAKE3 fingerprint of the input's `(len, mtime, size, first-4KiB, last-4KiB)`. The load path reads the sidecar, verifies the fingerprint against the current input, and skips the rebuild if fresh.
+PR-23 persists that index to a `<input>.shuflr-idx-zst` sidecar, gated by a BLAKE3 fingerprint of the input's `(basename, size, mtime_ns, inode, device, head-4KiB, mid-4KiB, tail-4KiB)` — see `crates/shuflr/src/index.rs::Fingerprint`. The load path reads the sidecar, verifies the fingerprint against the current input, and skips the rebuild if fresh. The fingerprint was hardened in a later PR from the `(name,size,mtime_secs)` form that earlier revisions of this bench doc described; a same-second in-place rewrite now flips the fingerprint via the nanosecond mtime and the three 4 KiB content samples.
 
 Wire format (see `crates/shuflr/src/io/zstd_seekable/record_index.rs`):
 
@@ -161,7 +161,7 @@ Measured on `tmp/edgar-0.05.jsonl.zst` (30.92 GB seekable-zstd, 1,199,612 record
 
 Output byte-identical across all three runs for the same `--seed`.
 
-The sidecar is **not** a security-sensitive cache: a fingerprint collision would at worst yield stale record positions that decompress-fail at runtime (not silent data corruption). We accept that risk in exchange for O(1) startup on repeat runs. Users who want to force a rebuild can delete the sidecar.
+The sidecar is a correctness-critical cache: if the fingerprint doesn't flip when the input changes, we silently serve records from the wrong byte ranges. The hardened fingerprint (see `Fingerprint::from_metadata` in `index.rs`) covers basename, size, nanosecond mtime, inode, device, and three 4 KiB content samples (head / middle / tail). An attacker or subtle in-place patch that preserves all of those simultaneously can still defeat it; users who need adversarial resistance should run with the sidecar deleted on every start. For typical workflows (atomic `mv`, append, total rewrite) the fingerprint flips reliably.
 
 ### Operation #14 — parallel record-index build (PR-26)
 

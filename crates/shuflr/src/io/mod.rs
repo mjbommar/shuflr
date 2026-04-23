@@ -48,12 +48,42 @@ impl Input {
             _ => Error::Io(e),
         })?;
         let size = file.metadata().map(|m| m.len()).ok();
-        build(Box::new(file), size, Some(path.to_path_buf()))
+        build(Box::new(file), size, Some(path.to_path_buf()), None)
+    }
+
+    /// Open with an explicit format, overriding magic-byte detection.
+    /// Used by `shuflr convert --input-format=…` as an escape hatch
+    /// when a valid input lacks canonical magic bytes (e.g. a plain
+    /// JSONL file whose first bytes happen to start with `{`, `[`, or
+    /// other confusing prefixes, or a stripped compressed file).
+    ///
+    /// Passing [`magic::Format::Plain`] bypasses decompression entirely;
+    /// for the other variants the requested decoder is applied without
+    /// first peeking the magic bytes.
+    pub fn open_with_format(path: &Path, format: magic::Format) -> Result<Self> {
+        if path == Path::new("-") {
+            return Self::from_stdin_with_format(format);
+        }
+        let file = File::open(path).map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => Error::NotFound {
+                path: path.display().to_string(),
+            },
+            io::ErrorKind::PermissionDenied => Error::PermissionDenied {
+                path: path.display().to_string(),
+            },
+            _ => Error::Io(e),
+        })?;
+        let size = file.metadata().map(|m| m.len()).ok();
+        build(Box::new(file), size, Some(path.to_path_buf()), Some(format))
+    }
+
+    fn from_stdin_with_format(format: magic::Format) -> Result<Self> {
+        build(Box::new(io::stdin()), None, None, Some(format))
     }
 
     /// Wrap an already-open stdin.
     pub fn from_stdin() -> Result<Self> {
-        build(Box::new(io::stdin()), None, None)
+        build(Box::new(io::stdin()), None, None, None)
     }
 
     /// Build from any `Read + Send` (used in tests).
@@ -62,7 +92,7 @@ impl Input {
         size: Option<u64>,
         path: Option<PathBuf>,
     ) -> Result<Self> {
-        build(reader, size, path)
+        build(reader, size, path, None)
     }
 
     pub fn size_hint(&self) -> Option<u64> {
@@ -115,12 +145,26 @@ impl BufRead for Input {
 
 /// Peek magic bytes, wrap in the appropriate decoder if feature-enabled,
 /// and return a plain-bytes `BufRead` over a 2 MiB buffer.
-fn build(raw: Box<dyn Read + Send>, size: Option<u64>, path: Option<PathBuf>) -> Result<Input> {
+///
+/// `force_format` overrides magic-byte detection when `Some(...)` — the
+/// caller passed `--input-format=…` explicitly and wants the requested
+/// decoder regardless of what the head bytes look like.
+fn build(
+    raw: Box<dyn Read + Send>,
+    size: Option<u64>,
+    path: Option<PathBuf>,
+    force_format: Option<magic::Format>,
+) -> Result<Input> {
     // Small dedicated buffer for the peek. 16 bytes is enough for every
     // format's magic except LZ4 (4) / XZ (6) / bzip2 (3) / gzip (2) / zstd (4).
     let mut peeker = BufReader::with_capacity(64, raw);
-    let head = peeker.fill_buf().map_err(Error::Io)?.to_vec();
-    let format = magic::detect(&head);
+    let format = match force_format {
+        Some(f) => f,
+        None => {
+            let head = peeker.fill_buf().map_err(Error::Io)?;
+            magic::detect(head)
+        }
+    };
 
     let plain_reader: Box<dyn Read + Send> = match format {
         magic::Format::Plain => Box::new(peeker),

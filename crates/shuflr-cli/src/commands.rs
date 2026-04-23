@@ -1,8 +1,15 @@
 //! Subcommand handlers.
 //!
-//! `stream` is wired end-to-end for `--shuffle=none`. Everything else
-//! is a stub that prints a pointer to the design-doc section covering
-//! it and returns a typed exit code.
+//! Dispatch for every non-`serve` subcommand lives here: `stream` (with
+//! all five shuffle modes), `convert`, `info`, `analyze`, `index`,
+//! `verify`, `completions`, and `man`. `serve` is designed in
+//! `docs/design/005-serve-multi-transport.md` and not yet wired.
+//!
+//! Each public fn here takes its subcommand's clap-derived args struct
+//! and returns an `exit::Code`. The implementation modules (`shuflr::
+//! pipeline::*`, `shuflr::io::*`, `shuflr::analyze`) do the actual work;
+//! this module is the thin adapter that renders human/JSON output and
+//! maps library errors to sysexits.h codes.
 
 use std::io::{self, Write as _};
 use std::time::Instant;
@@ -735,12 +742,13 @@ fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
         ))
     })?;
 
-    let input = shuflr::io::Input::open(in_path)?;
+    let input = open_convert_input(in_path, args.input_format)?;
     let effective_threads = resolve_threads(args.threads as usize);
     let input_size = input.size_hint();
     tracing::info!(
         path = %in_path.display(),
         raw_format = ?input.raw_format(),
+        input_format_override = ?args.input_format,
         frame_size,
         level = args.level,
         threads = effective_threads,
@@ -894,6 +902,32 @@ fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
     Ok(())
 }
 
+/// Escape a string for embedding inside a JSON string literal.
+///
+/// Handles the four cases RFC 8259 §7 requires — `"`, `\`, and control
+/// bytes < 0x20 — plus a safety-net `\u{XXXX}` fallback for lone surrogates
+/// so we produce valid UTF-8 JSON for any input. Used by the hand-rolled
+/// `--json` writers that can't afford a `serde_json` dep.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x08' => out.push_str("\\b"),
+            '\x0c' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn resolve_threads(requested: usize) -> usize {
     if requested == 0 {
         // Mirror the library-side default: physical cores, not
@@ -902,6 +936,35 @@ fn resolve_threads(requested: usize) -> usize {
         shuflr::physical_cores()
     } else {
         requested
+    }
+}
+
+/// Map the CLI's `--input-format` enum to a library `magic::Format`, or
+/// return None for `auto` (magic-byte detection). Enables `convert` to
+/// bypass auto-detect when the user knows the input format and the
+/// magic bytes lie or are missing.
+#[cfg(feature = "zstd")]
+fn resolve_input_format(fmt: cli::InputFormat) -> Option<shuflr::io::magic::Format> {
+    match fmt {
+        cli::InputFormat::Auto => None,
+        cli::InputFormat::Plain => Some(shuflr::io::magic::Format::Plain),
+        cli::InputFormat::Gzip => Some(shuflr::io::magic::Format::Gzip),
+        cli::InputFormat::Zstd => Some(shuflr::io::magic::Format::Zstd),
+        #[cfg(feature = "bzip2")]
+        cli::InputFormat::Bz2 => Some(shuflr::io::magic::Format::Bzip2),
+        #[cfg(feature = "xz")]
+        cli::InputFormat::Xz => Some(shuflr::io::magic::Format::Xz),
+    }
+}
+
+#[cfg(feature = "zstd")]
+fn open_convert_input(
+    path: &std::path::Path,
+    fmt: cli::InputFormat,
+) -> shuflr::Result<shuflr::io::Input> {
+    match resolve_input_format(fmt) {
+        Some(forced) => shuflr::io::Input::open_with_format(path, forced),
+        None => shuflr::io::Input::open(path),
     }
 }
 
@@ -958,7 +1021,7 @@ fn info_inner(args: cli::InfoArgs) -> shuflr::Result<()> {
 \"frame_size_max\":{max_frame},\
 \"frame_size_median\":{med_frame}\
 }}",
-            path = args.input.display(),
+            path = json_escape(&args.input.display().to_string()),
             frames = table.num_frames(),
             compressed = total_size,
             decompressed = total_decompressed,
@@ -1064,10 +1127,14 @@ fn analyze_inner(args: cli::AnalyzeArgs) -> shuflr::Result<shuflr::analyze::Verd
                 other => other,
             })?;
 
+        // Fixed sampling seed — the verdict must depend only on the
+        // input and --sample-chunks, never on --strict. --strict only
+        // controls the exit code.
+        const ANALYZE_SAMPLE_SEED: u64 = 0;
         let report = shuflr::analyze::run(
             &mut reader,
             args.sample_chunks as usize,
-            args.strict as u64, // deterministic but not user-exposed
+            ANALYZE_SAMPLE_SEED,
         )?;
 
         if args.json {
@@ -1181,8 +1248,9 @@ fn print_report_json(
         shuflr::analyze::Verdict::Safe => "safe",
         shuflr::analyze::Verdict::Unsafe => "unsafe",
     };
-    // Hand-written JSON (same style as `info --json`). Path is on Unix so
-    // it's ASCII-clean in practice; any `\` or `"` would need escaping.
+    // Hand-written JSON (same style as `info --json`). Path is escaped
+    // via `json_escape` so filenames containing `"`, `\`, or control
+    // bytes still produce valid JSON.
     writeln!(
         out,
         "{{\
@@ -1204,7 +1272,7 @@ fn print_report_json(
 }},\
 \"verdict\":\"{verdict}\"\
 }}",
-        path = path.display(),
+        path = json_escape(&path.display().to_string()),
         total_frames = report.total_frames,
         sampled_frames = report.sampled_frames,
         records_sampled = report.total_records_sampled,
@@ -1412,26 +1480,15 @@ fn verify_inner(args: cli::VerifyArgs) -> shuflr::Result<VerifyOutcome> {
         if raw_format == shuflr::io::magic::Format::Zstd
             && let Ok(_) = shuflr::io::zstd_seekable::SeekableReader::open(path)
         {
-            return verify_seekable(path);
+            return verify_seekable(path, args.deep);
         }
     }
 
-    // Plain / streaming-compressed path: scan records via passthrough.
-    let input = shuflr::io::Input::open(path)?;
-    // Use a generous default max-line: verify's job is to report oversized
-    // records, not to fail on them. A user who wants stricter bounds can pipe
-    // through `shuflr stream --max-line=X --on-error=fail` explicitly.
-    const DEFAULT_MAX_LINE: u64 = 16 * 1024 * 1024;
-    let cfg = shuflr::pipeline::PassthroughConfig {
-        max_line: DEFAULT_MAX_LINE,
-        on_error: shuflr::OnError::Skip,
-        sample: None,
-        ensure_trailing_newline: false,
-        partition: None,
-    };
-    let _ = args.deep; // --deep reserved for a future JSON-parse pass; not used here
+    // Plain / streaming-compressed path: scan records directly so we can
+    // apply the optional --deep JSON validation without adding a hook
+    // into the passthrough pipeline.
     let started = Instant::now();
-    let stats = shuflr::pipeline::passthrough(input, std::io::sink(), &cfg)?;
+    let scan = scan_records_plain(path, args.deep)?;
     let elapsed = started.elapsed();
 
     let mut stdout = std::io::stdout().lock();
@@ -1441,15 +1498,21 @@ fn verify_inner(args: cli::VerifyArgs) -> shuflr::Result<VerifyOutcome> {
     writeln!(
         stdout,
         "records:       {} ({:.1} ms)",
-        stats.records_in,
+        scan.records,
         elapsed.as_secs_f64() * 1000.0
     )
     .map_err(shuflr::Error::Io)?;
-    writeln!(stdout, "bytes:         {}", stats.bytes_in).map_err(shuflr::Error::Io)?;
-    writeln!(stdout, "oversized:     {}", stats.oversized_skipped).map_err(shuflr::Error::Io)?;
-    writeln!(stdout, "trailing-partial: {}", stats.had_trailing_partial)
-        .map_err(shuflr::Error::Io)?;
-    let ok = stats.oversized_skipped == 0 && !stats.had_trailing_partial;
+    writeln!(stdout, "bytes:         {}", scan.bytes).map_err(shuflr::Error::Io)?;
+    writeln!(stdout, "oversized:     {}", scan.oversized).map_err(shuflr::Error::Io)?;
+    writeln!(stdout, "trailing-partial: {}", scan.trailing_partial).map_err(shuflr::Error::Io)?;
+    if args.deep {
+        writeln!(stdout, "deep-json:     {} invalid", scan.json_invalid)
+            .map_err(shuflr::Error::Io)?;
+        for (idx, err) in scan.first_json_errors.iter().take(3) {
+            writeln!(stdout, "  record {idx}: {err}").map_err(shuflr::Error::Io)?;
+        }
+    }
+    let ok = scan.oversized == 0 && !scan.trailing_partial && scan.json_invalid == 0;
     writeln!(
         stdout,
         "verdict:       {}",
@@ -1463,12 +1526,93 @@ fn verify_inner(args: cli::VerifyArgs) -> shuflr::Result<VerifyOutcome> {
     })
 }
 
+/// Aggregated results of a plain/streaming scan, with optional deep
+/// JSON validation stats.
+#[derive(Default)]
+struct PlainScan {
+    records: u64,
+    bytes: u64,
+    oversized: u64,
+    trailing_partial: bool,
+    json_invalid: u64,
+    /// Up to N (record-index, error-message) for user-facing diagnostics.
+    first_json_errors: Vec<(u64, String)>,
+}
+
+fn scan_records_plain(path: &std::path::Path, deep: bool) -> shuflr::Result<PlainScan> {
+    use std::io::Read as _;
+
+    // Same cap the verify used to run with through the passthrough path.
+    const MAX_LINE: usize = 16 * 1024 * 1024;
+
+    let mut input = shuflr::io::Input::open(path)?;
+    let mut scan = PlainScan::default();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut pending: Vec<u8> = Vec::with_capacity(1 << 20);
+
+    loop {
+        let n = input.read(&mut buf).map_err(shuflr::Error::Io)?;
+        if n == 0 {
+            break;
+        }
+        pending.extend_from_slice(&buf[..n]);
+        // Emit each complete line.
+        while let Some(nl) = memchr::memchr(b'\n', &pending) {
+            let end = nl + 1;
+            let rec = &pending[..end];
+            let rec_len = rec.len();
+            scan.records += 1;
+            scan.bytes += rec_len as u64;
+            if rec_len > MAX_LINE {
+                scan.oversized += 1;
+            } else if deep {
+                validate_deep(&rec[..rec_len.saturating_sub(1)], scan.records, &mut scan);
+            }
+            pending.drain(..end);
+        }
+        if pending.len() > MAX_LINE {
+            // Over-long pending without a newline → oversized trailing.
+            scan.oversized += 1;
+            scan.trailing_partial = true;
+            pending.clear();
+        }
+    }
+    if !pending.is_empty() {
+        scan.trailing_partial = true;
+        scan.records += 1;
+        scan.bytes += pending.len() as u64;
+        if deep {
+            validate_deep(&pending, scan.records, &mut scan);
+        }
+    }
+    Ok(scan)
+}
+
+fn validate_deep(rec: &[u8], record_idx: u64, scan: &mut PlainScan) {
+    use shuflr::json_validate::validate;
+    if let Err(e) = validate(rec, 128) {
+        scan.json_invalid += 1;
+        if scan.first_json_errors.len() < 8 {
+            scan.first_json_errors.push((record_idx, e.to_string()));
+        }
+    }
+}
+
 #[cfg(feature = "zstd")]
-fn verify_seekable(path: &std::path::Path) -> shuflr::Result<VerifyOutcome> {
+fn verify_seekable(path: &std::path::Path, deep: bool) -> shuflr::Result<VerifyOutcome> {
     use std::io::Write as _;
     let started = Instant::now();
     let report = shuflr::io::zstd_seekable::verify(path)?;
     let elapsed = started.elapsed();
+
+    // --deep: decode each frame again and validate every record as JSON.
+    // Keeps memory bounded (one frame at a time). Costs one full pass
+    // over the input.
+    let deep_stats = if deep && report.frame_errors.is_empty() {
+        Some(deep_validate_seekable(path)?)
+    } else {
+        None
+    };
 
     let mut stdout = std::io::stdout().lock();
     writeln!(stdout, "verify:        {}", path.display()).map_err(shuflr::Error::Io)?;
@@ -1483,11 +1627,8 @@ fn verify_seekable(path: &std::path::Path) -> shuflr::Result<VerifyOutcome> {
     )
     .map_err(shuflr::Error::Io)?;
     writeln!(stdout, "bytes:         {}", report.total_decompressed).map_err(shuflr::Error::Io)?;
-    if report.frame_errors.is_empty() {
-        writeln!(stdout, "verdict:       OK — every frame decoded cleanly")
-            .map_err(shuflr::Error::Io)?;
-        Ok(VerifyOutcome::Ok)
-    } else {
+    let frame_ok = report.frame_errors.is_empty();
+    if !frame_ok {
         writeln!(
             stdout,
             "verdict:       FAILED — {} frame error(s):",
@@ -1505,8 +1646,85 @@ fn verify_seekable(path: &std::path::Path) -> shuflr::Result<VerifyOutcome> {
             )
             .map_err(shuflr::Error::Io)?;
         }
-        Ok(VerifyOutcome::Failed)
+        return Ok(VerifyOutcome::Failed);
     }
+    if let Some(deep) = deep_stats {
+        writeln!(
+            stdout,
+            "deep-json:     {} invalid / {} records",
+            deep.invalid, deep.checked
+        )
+        .map_err(shuflr::Error::Io)?;
+        for (idx, err) in deep.first_errors.iter().take(3) {
+            writeln!(stdout, "  record {idx}: {err}").map_err(shuflr::Error::Io)?;
+        }
+        if deep.invalid > 0 {
+            writeln!(
+                stdout,
+                "verdict:       FAILED — {} record(s) failed JSON parse",
+                deep.invalid
+            )
+            .map_err(shuflr::Error::Io)?;
+            return Ok(VerifyOutcome::Failed);
+        }
+    }
+    writeln!(
+        stdout,
+        "verdict:       OK — every frame decoded cleanly{}",
+        if deep {
+            " and every record parses as JSON"
+        } else {
+            ""
+        }
+    )
+    .map_err(shuflr::Error::Io)?;
+    Ok(VerifyOutcome::Ok)
+}
+
+#[cfg(feature = "zstd")]
+struct DeepStats {
+    checked: u64,
+    invalid: u64,
+    first_errors: Vec<(u64, String)>,
+}
+
+#[cfg(feature = "zstd")]
+fn deep_validate_seekable(path: &std::path::Path) -> shuflr::Result<DeepStats> {
+    use shuflr::json_validate::validate;
+
+    let mut reader = shuflr::io::zstd_seekable::SeekableReader::open(path)?;
+    let n_frames = reader.num_frames();
+    let mut stats = DeepStats {
+        checked: 0,
+        invalid: 0,
+        first_errors: Vec::new(),
+    };
+    for frame_id in 0..n_frames {
+        let frame = reader.decompress_frame(frame_id)?;
+        let mut start = 0usize;
+        for nl in memchr::memchr_iter(b'\n', &frame) {
+            stats.checked += 1;
+            let rec = &frame[start..nl]; // strip trailing \n for the validator
+            if let Err(e) = validate(rec, 128) {
+                stats.invalid += 1;
+                if stats.first_errors.len() < 8 {
+                    stats.first_errors.push((stats.checked, e.to_string()));
+                }
+            }
+            start = nl + 1;
+        }
+        if start < frame.len() {
+            stats.checked += 1;
+            let rec = &frame[start..];
+            if let Err(e) = validate(rec, 128) {
+                stats.invalid += 1;
+                if stats.first_errors.len() < 8 {
+                    stats.first_errors.push((stats.checked, e.to_string()));
+                }
+            }
+        }
+    }
+    Ok(stats)
 }
 
 pub fn completions(args: cli::CompletionsArgs) -> exit::Code {

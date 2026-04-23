@@ -41,6 +41,7 @@ clap_mangen = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 indicatif = "0.17"
+memchr = "2"
 
 [dev-dependencies]
 assert_cmd = "2"

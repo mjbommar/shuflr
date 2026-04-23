@@ -13,7 +13,7 @@
 //!   Magic         [u8; 8]  = b"SHUFLRZI"
 //!   Version       u8       = 1
 //!   Reserved      [u8; 7]  = 0
-//!   Fingerprint   [u8; 32] = blake3(basename ‖ size ‖ mtime_secs)
+//!   Fingerprint   [u8; 32] = see [`crate::index::Fingerprint`]
 //!   Count         u64
 //!   Entries       [(u32 frame_id, u32 offset_in_frame, u32 length); Count]
 //! ```

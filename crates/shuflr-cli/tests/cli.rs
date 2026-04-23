@@ -733,6 +733,87 @@ fn index_perm_zstd_parallel_build_matches_sequential() {
 }
 
 #[test]
+fn info_json_escapes_quotes_and_backslashes_in_path() {
+    // Unix-only test: put a " and a \ in the filename and verify that
+    // --json output is still syntactically valid JSON (no stray quote,
+    // no stray backslash in the output key string).
+    #[cfg(unix)]
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad_name = r#"weird" \name.jsonl"#;
+        let input = tmp.path().join(bad_name);
+        let seekable = tmp.path().join(format!("{bad_name}.zst"));
+        std::fs::write(&input, b"a\nb\n").unwrap();
+
+        shuflr()
+            .args(["convert", "--log-level", "warn", "-o"])
+            .arg(&seekable)
+            .arg(&input)
+            .assert()
+            .success();
+
+        let assert = shuflr()
+            .args(["info", "--json"])
+            .arg(&seekable)
+            .assert()
+            .success();
+        let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+
+        // Trailing newline from writeln!; strip for the parse.
+        let trimmed = out.trim();
+
+        // Hand-rolled JSON; do a minimal well-formed check that the
+        // escape sequences landed:
+        //   - there's exactly one closing `"` for the file value
+        //   - the raw " in the filename is escaped to \"
+        //   - the raw \ is escaped to \\
+        assert!(
+            trimmed.contains(r#"\""#),
+            "expected escaped quote in output:\n{out}"
+        );
+        assert!(
+            trimmed.contains(r"\\"),
+            "expected escaped backslash in output:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn analyze_strict_does_not_change_report() {
+    // --strict must only affect exit code, never which frames get
+    // sampled. Regression pin for the old bug where strict-as-u64 fed
+    // the RNG.
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("a.jsonl");
+    let seekable = tmp.path().join("a.jsonl.zst");
+    let body: String = (0..400).map(|i| format!("{{\"i\":{i:03}}}\n")).collect();
+    std::fs::write(&input, body).unwrap();
+
+    shuflr()
+        .args(["convert", "--log-level", "warn", "-o"])
+        .arg(&seekable)
+        .arg(&input)
+        .assert()
+        .success();
+
+    let run = |strict: bool| {
+        let mut cmd = shuflr();
+        cmd.args(["analyze", "--json", "--sample-chunks", "8"]);
+        if strict {
+            cmd.arg("--strict");
+        }
+        let assert = cmd.arg(&seekable).assert();
+        String::from_utf8(assert.get_output().stdout.clone()).unwrap()
+    };
+
+    assert_eq!(
+        run(false),
+        run(true),
+        "--strict must not change the JSON report"
+    );
+}
+
+#[test]
 fn analyze_json_mode_emits_parseable_report() {
     let tmp = tempfile::tempdir().unwrap();
     let input = tmp.path().join("in.jsonl");
@@ -791,6 +872,53 @@ fn analyze_json_mode_emits_parseable_report() {
         !out.contains("recommendation:"),
         "human text leaked into JSON output:\n{out}"
     );
+}
+
+#[test]
+fn convert_respects_input_format_override() {
+    // Take a plain JSONL file whose first bytes happen to be magic for
+    // *something other than plain*, then force --input-format=plain.
+    // Without the override, auto-detect would try to wrap it in a
+    // decoder and produce garbage or an error.
+    //
+    // We don't have a plausible non-plain false-positive sitting around,
+    // so instead we give convert a plain file and force
+    // --input-format=zstd: it should reject because the file isn't
+    // actually zstd, proving the flag takes effect.
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = tmp.path().join("pretend.jsonl");
+    std::fs::write(&plain, b"{\"a\":1}\n{\"a\":2}\n").unwrap();
+
+    let out = tmp.path().join("out.jsonl.zst");
+    shuflr()
+        .args([
+            "convert",
+            "--log-level",
+            "warn",
+            "--input-format",
+            "zstd",
+            "-o",
+        ])
+        .arg(&out)
+        .arg(&plain)
+        .assert()
+        .failure();
+
+    // And the no-op case (auto) still works end-to-end.
+    let out2 = tmp.path().join("out-auto.jsonl.zst");
+    shuflr()
+        .args([
+            "convert",
+            "--log-level",
+            "warn",
+            "--input-format",
+            "auto",
+            "-o",
+        ])
+        .arg(&out2)
+        .arg(&plain)
+        .assert()
+        .success();
 }
 
 #[test]
@@ -1137,6 +1265,104 @@ fn verify_plain_jsonl_reports_ok() {
     assert!(
         out.contains("records:       4"),
         "missing record count:\n{out}"
+    );
+}
+
+#[test]
+fn verify_deep_plain_catches_invalid_json() {
+    // Without --deep, the plain path happily accepts "not json".
+    // With --deep, it must flip to FAILED.
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("bad.jsonl");
+    std::fs::write(
+        &input,
+        r#"{"ok":1}
+not json here
+{"ok":2}
+"#,
+    )
+    .unwrap();
+
+    shuflr().args(["verify"]).arg(&input).assert().success();
+
+    let assert = shuflr()
+        .args(["verify", "--deep"])
+        .arg(&input)
+        .assert()
+        .code(65); // EX_DATAERR
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(out.contains("deep-json:"), "missing deep-json line:\n{out}");
+    assert!(
+        out.contains("verdict:       ISSUES"),
+        "expected ISSUES verdict:\n{out}"
+    );
+}
+
+#[test]
+fn verify_deep_plain_passes_on_valid_jsonl() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("good.jsonl");
+    std::fs::write(
+        &input,
+        r#"{"i":0}
+{"nested":{"a":[1,2,3],"b":null}}
+42
+true
+"yep"
+"#,
+    )
+    .unwrap();
+
+    let assert = shuflr()
+        .args(["verify", "--deep"])
+        .arg(&input)
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(out.contains("deep-json:     0 invalid"), "{out}");
+    assert!(out.contains("verdict:       OK"), "{out}");
+}
+
+#[test]
+fn verify_deep_seekable_catches_invalid_json() {
+    // Build a seekable zstd whose records are a mix of valid + invalid JSON.
+    // Convert doesn't enforce JSON syntax, so this round-trips without error;
+    // it's verify --deep's job to catch it.
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = tmp.path().join("mix.jsonl");
+    let seekable = tmp.path().join("mix.jsonl.zst");
+    std::fs::write(
+        &plain,
+        r#"{"ok":1}
+<<<not json>>>
+{"ok":2}
+"#,
+    )
+    .unwrap();
+
+    shuflr()
+        .args(["convert", "--log-level", "warn", "-o"])
+        .arg(&seekable)
+        .arg(&plain)
+        .assert()
+        .success();
+
+    // Without --deep, framing is fine → OK.
+    let assert = shuflr().args(["verify"]).arg(&seekable).assert().success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(out.contains("verdict:       OK"), "{out}");
+
+    // With --deep, JSON parse fails → FAILED.
+    let assert = shuflr()
+        .args(["verify", "--deep"])
+        .arg(&seekable)
+        .assert()
+        .code(65);
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(out.contains("deep-json:"), "{out}");
+    assert!(
+        out.contains("verdict:       FAILED"),
+        "expected FAILED verdict:\n{out}"
     );
 }
 

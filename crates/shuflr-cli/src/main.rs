@@ -1,8 +1,13 @@
 //! `shuflr` — streaming shuffled JSONL.
 //!
-//! PR-2 scope: CLI dispatch + `--shuffle=none` serial passthrough on plain
-//! JSONL files and stdin. Everything else is stubbed. See
-//! `docs/design/002-revised-plan.md` and amendments 003/004 for the plan.
+//! Binary crate. All five shuffle modes (`none`, `buffer`, `chunk-shuffled`,
+//! `index-perm`, `reservoir`) are wired through `subcommand::stream`;
+//! `convert`, `info`, `analyze`, `index`, `verify`, `completions`, and
+//! `man` are also live. `serve` is designed in
+//! `docs/design/005-serve-multi-transport.md` but not yet implemented.
+//!
+//! See `docs/design/002-revised-plan.md` for the v1 spec and amendments
+//! 003 / 004 / 005 for later additions.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 

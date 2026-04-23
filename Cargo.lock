@@ -3286,6 +3286,7 @@ dependencies = [
  "clap_mangen",
  "flate2",
  "indicatif",
+ "memchr",
  "predicates",
  "shuflr",
  "tempfile",

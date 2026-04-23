@@ -128,9 +128,15 @@ chunk-shuffled full file in 154 s at 1.19 GB/s.
   analyze.
 - **`crates/shuflr-cli`** — binary: clap-derive CLI, subcommand dispatch,
   indicatif progress, sysexits.h exit codes.
-- **`docs/design/`** — numbered design iterations (001 initial, 002 revised
-  authoritative spec, 003 compression formats, 004 convert subcommand) plus
-  seven Opus reviews in `review-01/` that drove 002.
+- **`docs/design/`** — numbered design iterations:
+  - `001-initial-plan.md` — original sketch
+  - `002-revised-plan.md` — v1 authoritative spec (read this first for algorithms)
+  - `003-compression-formats.md` — streaming compression policy (amends 002 §4.4)
+  - `004-convert-subcommand.md` — `convert` + `info` + seekable-zstd reader (amends 002)
+  - `005-serve-multi-transport.md` — `serve` design with HTTP/wire/gRPC transports (supersedes 002 §7)
+  - `review-01/` — seven Opus reviews that drove 002
+
+  When reading older docs, check later-numbered docs for amendments. Design docs are append-only.
 
 See `CLAUDE.md` for project conventions (error posture, lint rules, perf
 targets, testing strategy, "stdout is sacred" rule).
@@ -140,7 +146,7 @@ targets, testing strategy, "stdout is sacred" rule).
 ```sh
 cargo fmt --all -- --check        # style
 cargo clippy --workspace --all-targets -- -D warnings   # lint
-cargo test --workspace --all-targets                    # ~130 tests
+cargo test --workspace --all-targets                    # ~180 tests
 cargo bench --bench throughput    # criterion baselines
 ```
 
