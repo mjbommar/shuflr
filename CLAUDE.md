@@ -24,7 +24,10 @@ For provably uniform shuffles, `--shuffle=index-perm` builds and persists a `.sh
 
 **`docs/design/002-revised-plan.md`** is the v1 specification. It supersedes 001 on every conflict. Reviews that drove 002 live in `docs/design/review-01/`.
 
-Design docs are append-only iterations (`001-`, `002-`, …). When the design evolves, write a new doc referencing the prior one; don't rewrite history.
+**Amendments (applied on top of 002):**
+- `003-compression-formats.md` — compression codec policy. Supersedes 002 §4.4; promotes streaming `.gz` / `.zst` / `.bz2` / `.xz` to v1 (buffer/none/reservoir only); keeps seekable zstd + BGZF as v1.1 random-access formats.
+
+When reading 002, check later-numbered docs for amendments to any section you care about. Design docs are append-only iterations (`001-`, `002-`, …). When the design evolves, write a new doc referencing the prior one; don't rewrite history.
 
 ## Repository structure
 
