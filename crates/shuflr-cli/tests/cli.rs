@@ -763,6 +763,128 @@ fn stream_index_perm_rebuilds_when_fingerprint_mismatches() {
 }
 
 #[test]
+fn verify_plain_jsonl_reports_ok() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("clean.jsonl");
+    std::fs::write(&input, "a\nb\nc\nd\n").unwrap();
+    let assert = shuflr().args(["verify"]).arg(&input).assert().success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        out.contains("verdict:       OK"),
+        "missing OK verdict:\n{out}"
+    );
+    assert!(
+        out.contains("records:       4"),
+        "missing record count:\n{out}"
+    );
+}
+
+#[test]
+fn verify_seekable_ok_after_convert() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("in.jsonl");
+    let output = tmp.path().join("out.jsonl.zst");
+    let body: String = (0..300).map(|i| format!("{{\"i\":{i}}}\n")).collect();
+    std::fs::write(&input, &body).unwrap();
+
+    shuflr()
+        .args(["convert", "--log-level", "warn", "-o"])
+        .arg(&output)
+        .arg(&input)
+        .assert()
+        .success();
+
+    let assert = shuflr().args(["verify"]).arg(&output).assert().success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(out.contains("format:        zstd-seekable"), "\n{out}");
+    assert!(out.contains("verdict:       OK"), "\n{out}");
+}
+
+#[test]
+fn verify_seekable_falls_back_to_streaming_when_trailer_broken() {
+    // Trailer corruption only breaks seekability; the zstd frames still
+    // decode cleanly as a streaming blob. Verify should say so — and
+    // still pass, because the data is intact.
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("in.jsonl");
+    let output = tmp.path().join("out.jsonl.zst");
+    std::fs::write(&input, "a\nb\nc\nd\ne\n").unwrap();
+
+    shuflr()
+        .args(["convert", "--log-level", "warn", "-o"])
+        .arg(&output)
+        .arg(&input)
+        .assert()
+        .success();
+
+    // Stomp the seek-table trailer magic.
+    let mut bytes = std::fs::read(&output).unwrap();
+    let n = bytes.len();
+    bytes[n - 3] ^= 0xff;
+    std::fs::write(&output, &bytes).unwrap();
+
+    let assert = shuflr().args(["verify"]).arg(&output).assert().success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        out.contains("zstd (streaming)"),
+        "expected streaming fallback when trailer is broken:\n{out}"
+    );
+}
+
+#[test]
+fn verify_seekable_fails_when_frame_body_corrupted() {
+    // Stomping bytes deep inside a zstd frame makes the decoder error;
+    // verify should exit 65 and say FAILED.
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("in.jsonl");
+    let output = tmp.path().join("out.jsonl.zst");
+    // Enough records to force more than one frame so the body corruption
+    // is on a frame that the seek-table parse reaches.
+    let body: String = (0..3000)
+        .map(|i| format!("padding_padding_padding_padding_padding_{i:05}\n"))
+        .collect();
+    std::fs::write(&input, &body).unwrap();
+
+    shuflr()
+        .args(["convert", "--log-level", "warn", "-o"])
+        .arg(&output)
+        .arg(&input)
+        .assert()
+        .success();
+
+    // Stomp 64 bytes deep inside frame 0's compressed body.
+    let mut bytes = std::fs::read(&output).unwrap();
+    for b in bytes.iter_mut().take(80).skip(16) {
+        *b = 0x55;
+    }
+    std::fs::write(&output, &bytes).unwrap();
+
+    let assert = shuflr().args(["verify"]).arg(&output).assert().code(65); // EX_DATAERR
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        out.contains("verdict:       FAILED"),
+        "expected FAILED verdict:\n{out}"
+    );
+}
+
+#[test]
+fn verify_flags_trailing_partial_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("partial.jsonl");
+    // Missing trailing newline on the last record.
+    std::fs::write(&input, "one\ntwo\nthree").unwrap();
+    let assert = shuflr()
+        .args(["verify"])
+        .arg(&input)
+        .assert()
+        .code(65) // EX_DATAERR
+        ;
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(out.contains("trailing-partial: true"), "\n{out}");
+    assert!(out.contains("verdict:       ISSUES"), "\n{out}");
+}
+
+#[test]
 fn convert_preserves_crlf_and_nul() {
     let tmp = tempfile::tempdir().unwrap();
     let input_path = tmp.path().join("in.jsonl");

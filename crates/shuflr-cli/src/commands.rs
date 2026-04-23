@@ -1087,11 +1087,142 @@ fn index_inner(args: cli::IndexArgs) -> shuflr::Result<()> {
     Ok(())
 }
 
-pub fn verify(_args: cli::VerifyArgs) -> exit::Code {
-    stub(
-        "verify",
-        "002 §11.2 (edge-case matrix); lands with PR-3 (streaming framing)".into(),
+pub fn verify(args: cli::VerifyArgs) -> exit::Code {
+    match verify_inner(args) {
+        Ok(VerifyOutcome::Ok) => exit::Code::Ok,
+        Ok(VerifyOutcome::Failed) => exit::Code::DataErr,
+        Err(e) => report_library_error(&e),
+    }
+}
+
+enum VerifyOutcome {
+    Ok,
+    Failed,
+}
+
+fn verify_inner(args: cli::VerifyArgs) -> shuflr::Result<VerifyOutcome> {
+    use std::io::Write as _;
+
+    if args.input.inputs.len() != 1 {
+        return Err(shuflr::Error::Input(
+            "`shuflr verify` accepts exactly one input".into(),
+        ));
+    }
+    let path = &args.input.inputs[0];
+    if path == std::path::Path::new("-") {
+        return Err(shuflr::Error::Input(
+            "`shuflr verify` needs a file on disk (stdin has no seek table)".into(),
+        ));
+    }
+
+    // Peek the format. If it's zstd AND the tail carries a seek table, do a
+    // frame-by-frame structural verify. Otherwise (plain JSONL / streaming
+    // compressed formats) fall through to a passthrough scan that counts
+    // records + flags oversized / partial-tail framing issues.
+    let probe = shuflr::io::Input::open(path)?;
+    let raw_format = probe.raw_format();
+    drop(probe);
+
+    #[cfg(feature = "zstd")]
+    {
+        if raw_format == shuflr::io::magic::Format::Zstd
+            && let Ok(_) = shuflr::io::zstd_seekable::SeekableReader::open(path)
+        {
+            return verify_seekable(path);
+        }
+    }
+
+    // Plain / streaming-compressed path: scan records via passthrough.
+    let input = shuflr::io::Input::open(path)?;
+    // Use a generous default max-line: verify's job is to report oversized
+    // records, not to fail on them. A user who wants stricter bounds can pipe
+    // through `shuflr stream --max-line=X --on-error=fail` explicitly.
+    const DEFAULT_MAX_LINE: u64 = 16 * 1024 * 1024;
+    let cfg = shuflr::pipeline::PassthroughConfig {
+        max_line: DEFAULT_MAX_LINE,
+        on_error: shuflr::OnError::Skip,
+        sample: None,
+        ensure_trailing_newline: false,
+        partition: None,
+    };
+    let _ = args.deep; // --deep reserved for a future JSON-parse pass; not used here
+    let started = Instant::now();
+    let stats = shuflr::pipeline::passthrough(input, std::io::sink(), &cfg)?;
+    let elapsed = started.elapsed();
+
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "verify:        {}", path.display()).map_err(shuflr::Error::Io)?;
+    writeln!(stdout, "format:        {} (streaming)", raw_format.name())
+        .map_err(shuflr::Error::Io)?;
+    writeln!(
+        stdout,
+        "records:       {} ({:.1} ms)",
+        stats.records_in,
+        elapsed.as_secs_f64() * 1000.0
     )
+    .map_err(shuflr::Error::Io)?;
+    writeln!(stdout, "bytes:         {}", stats.bytes_in).map_err(shuflr::Error::Io)?;
+    writeln!(stdout, "oversized:     {}", stats.oversized_skipped).map_err(shuflr::Error::Io)?;
+    writeln!(stdout, "trailing-partial: {}", stats.had_trailing_partial)
+        .map_err(shuflr::Error::Io)?;
+    let ok = stats.oversized_skipped == 0 && !stats.had_trailing_partial;
+    writeln!(
+        stdout,
+        "verdict:       {}",
+        if ok { "OK" } else { "ISSUES" }
+    )
+    .map_err(shuflr::Error::Io)?;
+    Ok(if ok {
+        VerifyOutcome::Ok
+    } else {
+        VerifyOutcome::Failed
+    })
+}
+
+#[cfg(feature = "zstd")]
+fn verify_seekable(path: &std::path::Path) -> shuflr::Result<VerifyOutcome> {
+    use std::io::Write as _;
+    let started = Instant::now();
+    let report = shuflr::io::zstd_seekable::verify(path)?;
+    let elapsed = started.elapsed();
+
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "verify:        {}", path.display()).map_err(shuflr::Error::Io)?;
+    writeln!(stdout, "format:        zstd-seekable").map_err(shuflr::Error::Io)?;
+    writeln!(stdout, "frames:        {}", report.frames).map_err(shuflr::Error::Io)?;
+    writeln!(
+        stdout,
+        "records:       {} ({:.1} s elapsed, {:.1} MB/s decompressed)",
+        report.records,
+        elapsed.as_secs_f64(),
+        report.total_decompressed as f64 / elapsed.as_secs_f64() / 1_048_576.0,
+    )
+    .map_err(shuflr::Error::Io)?;
+    writeln!(stdout, "bytes:         {}", report.total_decompressed).map_err(shuflr::Error::Io)?;
+    if report.frame_errors.is_empty() {
+        writeln!(stdout, "verdict:       OK — every frame decoded cleanly")
+            .map_err(shuflr::Error::Io)?;
+        Ok(VerifyOutcome::Ok)
+    } else {
+        writeln!(
+            stdout,
+            "verdict:       FAILED — {} frame error(s):",
+            report.frame_errors.len()
+        )
+        .map_err(shuflr::Error::Io)?;
+        for err in report.frame_errors.iter().take(10) {
+            writeln!(stdout, "  • {err}").map_err(shuflr::Error::Io)?;
+        }
+        if report.frame_errors.len() > 10 {
+            writeln!(
+                stdout,
+                "  ({} more omitted)",
+                report.frame_errors.len() - 10
+            )
+            .map_err(shuflr::Error::Io)?;
+        }
+        Ok(VerifyOutcome::Failed)
+    }
 }
 
 pub fn completions(args: cli::CompletionsArgs) -> exit::Code {
