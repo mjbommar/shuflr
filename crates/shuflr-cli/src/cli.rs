@@ -281,6 +281,10 @@ pub struct AnalyzeArgs {
     /// Exit 3 on unsafe verdict (for scripting); default exits 0 with warning
     #[arg(long)]
     pub strict: bool,
+
+    /// Emit machine-readable JSON instead of a human summary
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]

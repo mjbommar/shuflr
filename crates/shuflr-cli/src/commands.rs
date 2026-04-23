@@ -1028,7 +1028,11 @@ fn analyze_inner(args: cli::AnalyzeArgs) -> shuflr::Result<shuflr::analyze::Verd
             args.strict as u64, // deterministic but not user-exposed
         )?;
 
-        print_report(path, &report)?;
+        if args.json {
+            print_report_json(path, &report)?;
+        } else {
+            print_report(path, &report)?;
+        }
 
         if args.strict && report.verdict == shuflr::analyze::Verdict::Unsafe {
             // `--strict` turns the warning into a non-zero exit so scripts
@@ -1121,6 +1125,60 @@ fn print_report(
             .map_err(shuflr::Error::Io)?;
         }
     }
+    Ok(())
+}
+
+#[cfg(feature = "zstd")]
+fn print_report_json(
+    path: &std::path::Path,
+    report: &shuflr::analyze::AnalysisReport,
+) -> shuflr::Result<()> {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    let verdict = match report.verdict {
+        shuflr::analyze::Verdict::Safe => "safe",
+        shuflr::analyze::Verdict::Unsafe => "unsafe",
+    };
+    // Hand-written JSON (same style as `info --json`). Path is on Unix so
+    // it's ASCII-clean in practice; any `\` or `"` would need escaping.
+    writeln!(
+        out,
+        "{{\
+\"file\":\"{path}\",\
+\"total_frames\":{total_frames},\
+\"sampled_frames\":{sampled_frames},\
+\"total_records_sampled\":{records_sampled},\
+\"mean_record_len_bytes\":{mean_len:.3},\
+\"byte_kl_max\":{kl_max:.6},\
+\"byte_kl_mean\":{kl_mean:.6},\
+\"byte_js_max\":{js_max:.6},\
+\"byte_js_mean\":{js_mean:.6},\
+\"frame_entropy_mean\":{ent_mean:.6},\
+\"reclen_cv\":{cv:.6},\
+\"thresholds\":{{\
+\"byte_kl_unsafe\":{kl_thresh},\
+\"byte_js_unsafe\":{js_thresh},\
+\"reclen_cv_unsafe\":{cv_thresh}\
+}},\
+\"verdict\":\"{verdict}\"\
+}}",
+        path = path.display(),
+        total_frames = report.total_frames,
+        sampled_frames = report.sampled_frames,
+        records_sampled = report.total_records_sampled,
+        mean_len = report.mean_record_len_bytes,
+        kl_max = report.byte_kl_max,
+        kl_mean = report.byte_kl_mean,
+        js_max = report.byte_js_max,
+        js_mean = report.byte_js_mean,
+        ent_mean = report.frame_entropy_mean,
+        cv = report.reclen_cv,
+        kl_thresh = shuflr::analyze::BYTE_KL_THRESHOLD_UNSAFE,
+        js_thresh = shuflr::analyze::BYTE_JS_THRESHOLD_UNSAFE,
+        cv_thresh = shuflr::analyze::RECLEN_CV_THRESHOLD_UNSAFE,
+        verdict = verdict,
+    )
+    .map_err(shuflr::Error::Io)?;
     Ok(())
 }
 

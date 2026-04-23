@@ -586,6 +586,67 @@ fn info_json_mode_parses_cleanly() {
 }
 
 #[test]
+fn analyze_json_mode_emits_parseable_report() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("in.jsonl");
+    let seekable = tmp.path().join("in.jsonl.zst");
+    // A small but non-trivial corpus so analyze has something to sample.
+    let body: String = (0..200).map(|i| format!("{{\"i\":{i:03}}}\n")).collect();
+    std::fs::write(&input, body).unwrap();
+
+    shuflr()
+        .args(["convert", "--log-level", "warn", "-o"])
+        .arg(&seekable)
+        .arg(&input)
+        .assert()
+        .success();
+
+    let assert = shuflr()
+        .args(["analyze", "--json"])
+        .arg(&seekable)
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let trimmed = out.trim();
+    assert!(
+        trimmed.starts_with('{') && trimmed.ends_with('}'),
+        "not a JSON object:\n{out}"
+    );
+    // Every field the report exposes should be present so scripts can
+    // pin to specific keys without fear of silent rename.
+    for key in [
+        "\"file\":",
+        "\"total_frames\":",
+        "\"sampled_frames\":",
+        "\"total_records_sampled\":",
+        "\"mean_record_len_bytes\":",
+        "\"byte_kl_max\":",
+        "\"byte_kl_mean\":",
+        "\"byte_js_max\":",
+        "\"byte_js_mean\":",
+        "\"frame_entropy_mean\":",
+        "\"reclen_cv\":",
+        "\"thresholds\":{",
+        "\"byte_kl_unsafe\":",
+        "\"byte_js_unsafe\":",
+        "\"reclen_cv_unsafe\":",
+        "\"verdict\":",
+    ] {
+        assert!(out.contains(key), "missing JSON key {key}:\n{out}");
+    }
+    // Verdict must be one of the two documented values.
+    assert!(
+        out.contains("\"verdict\":\"safe\"") || out.contains("\"verdict\":\"unsafe\""),
+        "verdict not a documented value:\n{out}"
+    );
+    // Human output must not leak into JSON mode.
+    assert!(
+        !out.contains("recommendation:"),
+        "human text leaked into JSON output:\n{out}"
+    );
+}
+
+#[test]
 fn convert_rejects_multi_input_in_pr4() {
     let tmp = tempfile::tempdir().unwrap();
     let a = tmp.path().join("a.jsonl");
