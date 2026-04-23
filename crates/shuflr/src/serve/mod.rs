@@ -11,8 +11,11 @@
 //! and one dataset catalog ([`catalog::Catalog`]). Each transport owns
 //! only its framing / wire adapter.
 
+pub mod auth;
 pub mod catalog;
 pub mod http;
+pub mod tls;
 
+pub use auth::{Auth, AuthOutcome, BearerConfig};
 pub use catalog::{Catalog, DatasetEntry};
 pub use http::{HttpConfig, run as run_http};

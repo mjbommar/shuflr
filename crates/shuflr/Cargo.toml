@@ -15,7 +15,9 @@ workspace = true
 [features]
 default = []
 # HTTP transport for the `serve` subcommand (005). Brings in tokio +
-# hyper (HTTP/1.1 only). TLS and auth are separate: see `serve-tls`.
+# hyper (HTTP/1.1 only), rustls for TLS, and constant-time token
+# comparison. TLS is always compiled in — users who enable `serve`
+# can still run without TLS (plain HTTP on loopback is the default).
 serve = [
     "dep:tokio",
     "dep:hyper",
@@ -23,6 +25,10 @@ serve = [
     "dep:http-body-util",
     "dep:tokio-stream",
     "dep:futures-util",
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:rustls-pemfile",
+    "dep:subtle",
 ]
 # Networked service (gRPC, async runtime).
 grpc = ["dep:tonic", "dep:prost", "dep:tokio"]
@@ -63,12 +69,16 @@ num_cpus = "1"
 # Feature-gated deps — all optional, pulled in only when a feature enables them.
 tonic = { version = "0.12", optional = true }
 prost = { version = "0.13", optional = true }
-tokio = { version = "1", optional = true, features = ["rt-multi-thread", "sync", "macros", "net", "time", "io-util"] }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "sync", "macros", "net", "time", "io-util", "signal"] }
 hyper = { version = "1", optional = true, features = ["server", "http1"] }
 hyper-util = { version = "0.1", optional = true, features = ["tokio", "server-auto"] }
 http-body-util = { version = "0.1", optional = true }
 tokio-stream = { version = "0.1", optional = true }
 futures-util = { version = "0.3", optional = true, default-features = false, features = ["std"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12", "ring"] }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["tls12", "ring"] }
+rustls-pemfile = { version = "2", optional = true }
+subtle = { version = "2", optional = true, default-features = false }
 metrics = { version = "0.23", optional = true }
 metrics-exporter-prometheus = { version = "0.15", optional = true }
 opentelemetry-otlp = { version = "0.27", optional = true }
@@ -85,6 +95,8 @@ seccompiler = { version = "0.4", optional = true }
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
+# Self-signed certs for TLS tests without an external openssl call.
+rcgen = "0.13"
 
 [[bench]]
 name = "throughput"

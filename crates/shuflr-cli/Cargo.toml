@@ -53,5 +53,8 @@ predicates = "3"
 tempfile = "3"
 flate2 = "1"
 zstd = "0.13"
-# Blocking HTTP client for serve tests. Single-crate, no tokio.
-ureq = { version = "2", default-features = false, features = ["json"] }
+# Blocking HTTP client for serve tests. `tls-rustls-no-provider` =
+# rustls with BYO crypto provider (we install ring at test startup).
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rcgen = "0.13"

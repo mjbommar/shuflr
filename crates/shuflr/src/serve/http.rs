@@ -16,6 +16,7 @@
 //! control (005 §3.6); HTTP rides TCP's.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -28,26 +29,112 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::error::{Error, Result};
 use crate::framing::OnError;
+use crate::serve::auth::{Auth, AuthOutcome};
 use crate::serve::catalog::Catalog;
 
-/// Configuration for [`run`].
+/// Paths to a TLS cert/key pair (and an optional client-CA bundle for
+/// mTLS). Parsed and handed to rustls at serve-up time.
+#[derive(Debug, Clone)]
+pub struct TlsPaths {
+    pub cert: PathBuf,
+    pub key: PathBuf,
+    pub client_ca: Option<PathBuf>,
+}
+
+/// Configuration for [`run`]. Built via [`HttpConfig::builder`] so we
+/// can enforce the cross-field invariants (`bind_public` gates
+/// non-loopback, TLS without `client_ca` is incompatible with
+/// `Auth::Mtls`, and so on) in one place.
 #[derive(Debug, Clone)]
 pub struct HttpConfig {
     pub addr: SocketAddr,
     pub catalog: Catalog,
+    pub tls: Option<TlsPaths>,
+    pub auth: Auth,
+    pub bind_public: bool,
+    pub insecure_public: bool,
 }
 
 impl HttpConfig {
+    /// Simple constructor for tests and loopback no-auth servers.
     pub fn new(addr: SocketAddr, catalog: Catalog) -> Result<Self> {
-        // PR-30 loopback-only policy. PR-31 adds --bind-public + TLS.
-        if !addr.ip().is_loopback() {
+        Self::builder(addr, catalog).build()
+    }
+
+    pub fn builder(addr: SocketAddr, catalog: Catalog) -> HttpConfigBuilder {
+        HttpConfigBuilder {
+            addr,
+            catalog,
+            tls: None,
+            auth: Auth::None,
+            bind_public: false,
+            insecure_public: false,
+        }
+    }
+}
+
+pub struct HttpConfigBuilder {
+    addr: SocketAddr,
+    catalog: Catalog,
+    tls: Option<TlsPaths>,
+    auth: Auth,
+    bind_public: bool,
+    insecure_public: bool,
+}
+
+impl HttpConfigBuilder {
+    pub fn tls(mut self, paths: TlsPaths) -> Self {
+        self.tls = Some(paths);
+        self
+    }
+    pub fn auth(mut self, auth: Auth) -> Self {
+        self.auth = auth;
+        self
+    }
+    pub fn bind_public(mut self, v: bool) -> Self {
+        self.bind_public = v;
+        self
+    }
+    pub fn insecure_public(mut self, v: bool) -> Self {
+        self.insecure_public = v;
+        self
+    }
+
+    pub fn build(self) -> Result<HttpConfig> {
+        let is_public = !self.addr.ip().is_loopback();
+        if is_public && !self.bind_public {
             return Err(Error::Input(format!(
-                "HTTP listener on {addr} is non-loopback; PR-30 only supports \
-                 127.0.0.1 / ::1. Non-loopback binding requires --bind-public \
-                 and TLS (shipping in PR-31)."
+                "HTTP listener on {} is non-loopback — pass --bind-public \
+                 to opt in (005 §4.1)",
+                self.addr
             )));
         }
-        Ok(Self { addr, catalog })
+        if is_public && self.tls.is_none() && !self.insecure_public {
+            return Err(Error::Input(format!(
+                "HTTP listener on {} is non-loopback without TLS — pass \
+                 --tls-cert/--tls-key, or --insecure-public to accept \
+                 plaintext (005 §4.2)",
+                self.addr
+            )));
+        }
+        if matches!(self.auth, Auth::Mtls) {
+            let Some(tls) = &self.tls else {
+                return Err(Error::Input(
+                    "--auth=mtls requires --tls-cert/--tls-key".into(),
+                ));
+            };
+            if tls.client_ca.is_none() {
+                return Err(Error::Input("--auth=mtls requires --tls-client-ca".into()));
+            }
+        }
+        Ok(HttpConfig {
+            addr: self.addr,
+            catalog: self.catalog,
+            tls: self.tls,
+            auth: self.auth,
+            bind_public: self.bind_public,
+            insecure_public: self.insecure_public,
+        })
     }
 }
 
@@ -55,39 +142,89 @@ impl HttpConfig {
 /// listener has closed and every in-flight response has completed.
 pub async fn run(cfg: HttpConfig, shutdown: impl std::future::Future<Output = ()>) -> Result<()> {
     use tokio::net::TcpListener;
+
+    let is_public = !cfg.addr.ip().is_loopback();
+    let tls_acceptor = if let Some(tls_paths) = &cfg.tls {
+        let server_cfg = crate::serve::tls::build_server_config(
+            &tls_paths.cert,
+            &tls_paths.key,
+            tls_paths.client_ca.as_deref(),
+        )?;
+        Some(tokio_rustls::TlsAcceptor::from(server_cfg))
+    } else {
+        None
+    };
+    let insecure_plaintext_public = is_public && tls_acceptor.is_none();
+    if insecure_plaintext_public {
+        tracing::warn!(
+            addr = %cfg.addr,
+            "serve(http): running UNENCRYPTED on public interface; all traffic is plaintext"
+        );
+    }
+
     let listener = TcpListener::bind(cfg.addr).await.map_err(Error::Io)?;
-    tracing::info!(addr = %cfg.addr, datasets = cfg.catalog.len(), "serve(http) bound");
+    tracing::info!(
+        addr = %cfg.addr,
+        datasets = cfg.catalog.len(),
+        tls = tls_acceptor.is_some(),
+        auth = ?cfg.auth,
+        "serve(http) bound",
+    );
 
     let catalog = Arc::new(cfg.catalog);
+    let auth = Arc::new(cfg.auth);
 
-    // Simple accept loop. A graceful shutdown story would track
-    // in-flight connections; for PR-30 we let tokio tear them down on
-    // runtime drop.
+    // Register a SIGHUP reload handler for bearer-token rotation on unix.
+    #[cfg(unix)]
+    {
+        let auth_for_hup = Arc::clone(&auth);
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut s = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(err = %e, "could not install SIGHUP handler");
+                    return;
+                }
+            };
+            while s.recv().await.is_some() {
+                tracing::info!("SIGHUP received; reloading bearer tokens");
+                auth_for_hup.reload_if_bearer();
+            }
+        });
+    }
+
     tokio::pin!(shutdown);
 
     loop {
         tokio::select! {
             accept = listener.accept() => {
-                let (stream, peer) = match accept {
+                let (tcp, peer) = match accept {
                     Ok(p) => p,
                     Err(e) => {
                         tracing::warn!(err = %e, "accept failed; continuing");
                         continue;
                     }
                 };
-                tracing::debug!(peer = %peer, "http: accepted");
+                if insecure_plaintext_public {
+                    tracing::warn!(peer = %peer, "serve(http): plaintext connection from public peer");
+                }
                 let catalog = Arc::clone(&catalog);
-                let io = TokioIo::new(stream);
+                let auth = Arc::clone(&auth);
+                let tls_acceptor = tls_acceptor.clone();
                 tokio::spawn(async move {
-                    let svc = service_fn(move |req| {
-                        let catalog = Arc::clone(&catalog);
-                        async move { handle(req, catalog).await }
-                    });
-                    if let Err(e) = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, svc)
-                        .await
-                    {
-                        tracing::debug!(err = %e, "http: conn closed with error");
+                    match tls_acceptor {
+                        Some(acceptor) => match acceptor.accept(tcp).await {
+                            Ok(tls_stream) => {
+                                serve_one(TokioIo::new(tls_stream), catalog, auth).await;
+                            }
+                            Err(e) => {
+                                tracing::debug!(peer = %peer, err = %e, "TLS handshake failed");
+                            }
+                        },
+                        None => {
+                            serve_one(TokioIo::new(tcp), catalog, auth).await;
+                        }
                     }
                 });
             }
@@ -100,6 +237,24 @@ pub async fn run(cfg: HttpConfig, shutdown: impl std::future::Future<Output = ()
     Ok(())
 }
 
+/// Drive one client connection: hyper HTTP/1.1 with our service.
+async fn serve_one<S>(io: TokioIo<S>, catalog: Arc<Catalog>, auth: Arc<Auth>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let svc = service_fn(move |req| {
+        let catalog = Arc::clone(&catalog);
+        let auth = Arc::clone(&auth);
+        async move { handle(req, catalog, auth).await }
+    });
+    if let Err(e) = hyper::server::conn::http1::Builder::new()
+        .serve_connection(io, svc)
+        .await
+    {
+        tracing::debug!(err = %e, "http: conn closed with error");
+    }
+}
+
 type BoxBody = Either<
     Full<Bytes>,
     StreamBody<ReceiverStream<std::result::Result<Frame<Bytes>, std::io::Error>>>,
@@ -108,10 +263,27 @@ type BoxBody = Either<
 async fn handle(
     req: Request<hyper::body::Incoming>,
     catalog: Arc<Catalog>,
+    auth: Arc<Auth>,
 ) -> std::result::Result<Response<BoxBody>, std::convert::Infallible> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
+
+    // /v1/health is left unauthenticated — operators / load balancers
+    // frequently probe it without credentials. Everything else goes
+    // through the configured policy.
+    let unauthed_path = path == "/v1/health";
+
+    if !unauthed_path {
+        let auth_header = req
+            .headers()
+            .get(hyper::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
+        match auth.verify_http_header(auth_header) {
+            AuthOutcome::Ok => {}
+            outcome => return Ok(auth_fail_response(outcome)),
+        }
+    }
 
     // Route table. Handlers return `Result<Response, HttpError>`; map to
     // Response uniformly below.
@@ -133,6 +305,29 @@ async fn handle(
         Ok(resp) => resp,
         Err(e) => e.into_response(),
     })
+}
+
+fn auth_fail_response(outcome: AuthOutcome) -> Response<BoxBody> {
+    let (status, detail) = match outcome {
+        AuthOutcome::Ok => unreachable!("auth_fail_response called with Ok"),
+        AuthOutcome::Missing => (StatusCode::UNAUTHORIZED, "missing Authorization header"),
+        AuthOutcome::Malformed => (StatusCode::UNAUTHORIZED, "malformed Authorization header"),
+        AuthOutcome::Mismatch => (StatusCode::UNAUTHORIZED, "bearer token not accepted"),
+        AuthOutcome::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "auth check failed"),
+    };
+    let body = format!("{{\"error\":\"unauthorized\",\"detail\":\"{}\"}}\n", detail);
+    let mut builder = Response::builder()
+        .status(status)
+        .header("content-type", "application/json; charset=utf-8");
+    if status == StatusCode::UNAUTHORIZED {
+        builder = builder.header("www-authenticate", "Bearer");
+    }
+    builder
+        .body(Either::Left(Full::new(Bytes::from(body))))
+        .unwrap_or_else(|e| {
+            tracing::error!(err = %e, "auth_fail_response build failed");
+            Response::new(Either::Left(Full::new(Bytes::from("internal\n"))))
+        })
 }
 
 #[derive(Debug)]

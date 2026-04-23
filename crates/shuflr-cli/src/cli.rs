@@ -184,8 +184,8 @@ pub struct StreamArgs {
 #[cfg(feature = "serve")]
 #[derive(Args, Debug)]
 pub struct ServeArgs {
-    /// HTTP listener (e.g. `127.0.0.1:9000`). Non-loopback binds will
-    /// be rejected in PR-30 — TLS + --bind-public ship in PR-31.
+    /// HTTP listener (e.g. `127.0.0.1:9000` or `0.0.0.0:443` with
+    /// --bind-public + TLS / --insecure-public).
     #[arg(long, value_name = "ADDR")]
     pub http: Option<String>,
 
@@ -198,15 +198,47 @@ pub struct ServeArgs {
     #[arg(long = "dataset", value_name = "ID=PATH")]
     pub datasets: Vec<String>,
 
-    /// Allow non-loopback bind (requires --tls-cert/--tls-key or
-    /// --insecure-public). Not enforced in PR-30 — a non-loopback
-    /// --http address is rejected regardless. Ships in PR-31.
+    /// Allow non-loopback bind. Requires TLS, OR --insecure-public.
     #[arg(long)]
     pub bind_public: bool,
+
+    /// Accept non-loopback plaintext (no TLS). Loud WARN per request.
+    /// Use only in trusted networks (VPN, VPC peering, etc.).
+    #[arg(long)]
+    pub insecure_public: bool,
+
+    /// TLS certificate (PEM). Enables HTTPS on the --http listener.
+    #[arg(long, value_name = "PATH")]
+    pub tls_cert: Option<std::path::PathBuf>,
+
+    /// TLS private key (PEM, PKCS8 / RSA / EC).
+    #[arg(long, value_name = "PATH")]
+    pub tls_key: Option<std::path::PathBuf>,
+
+    /// PEM bundle of CAs allowed to sign client certs (for mTLS).
+    #[arg(long, value_name = "PATH")]
+    pub tls_client_ca: Option<std::path::PathBuf>,
+
+    /// Authentication policy. `none` (default), `bearer` (requires
+    /// --auth-tokens), or `mtls` (requires TLS + --tls-client-ca).
+    #[arg(long, value_enum, default_value_t = AuthKind::None, value_name = "KIND")]
+    pub auth: AuthKind,
+
+    /// Newline-delimited bearer-token file. Reloadable via SIGHUP.
+    #[arg(long, value_name = "PATH")]
+    pub auth_tokens: Option<std::path::PathBuf>,
 
     /// Logging level (or $SHUFLR_LOG)
     #[arg(long, env = "SHUFLR_LOG", default_value = "info", value_name = "LEVEL")]
     pub log_level: String,
+}
+
+#[cfg(feature = "serve")]
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+pub enum AuthKind {
+    None,
+    Bearer,
+    Mtls,
 }
 
 #[cfg(feature = "zstd")]

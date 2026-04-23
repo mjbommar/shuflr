@@ -173,3 +173,70 @@ def test_rank_requires_world_size():
             "http://x:9000/v1/streams/foo",
             rank=0,
         )
+
+
+def test_bearer_token_missing_raises(serve_factory, tmp_path):
+    """Client hits a bearer-auth'd server without a token → the
+    sentinel surfaces as OSError (via IOError) on iteration."""
+    ds_path = tmp_path / "c.jsonl"
+    ds_path.write_text("x\n")
+    # Reuse the existing loopback-no-TLS server fixture but force it
+    # behind bearer auth. Since serve_factory doesn't take auth args,
+    # spawn directly here via the same idiom.
+    import socket as _s
+    import subprocess as _sp
+    import time as _t
+
+    s = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+
+    tokens = tmp_path / "tok.txt"
+    tokens.write_text("realtoken\n")
+
+    bin_path = _find_shuflr_bin()
+    proc = subprocess.Popen(
+        [
+            str(bin_path),
+            "serve",
+            "--http",
+            f"127.0.0.1:{port}",
+            "--auth",
+            "bearer",
+            "--auth-tokens",
+            str(tokens),
+            "--dataset",
+            f"c={ds_path}",
+            "--log-level",
+            "info",
+        ],
+        stdout=_sp.PIPE,
+        stderr=_sp.PIPE,
+        text=True,
+    )
+    try:
+        deadline = _t.time() + 10
+        while _t.time() < deadline:
+            line = proc.stderr.readline()
+            if not line:
+                if proc.poll() is not None:
+                    raise RuntimeError("server died early")
+                continue
+            if "bound" in line:
+                break
+
+        # No token → server returns 401 at the HTTP layer before any
+        # body. Our client surfaces that as OSError / IOError.
+        ds = shuflr_client.Dataset(
+            f"http://127.0.0.1:{port}/v1/streams/c", shuffle="none"
+        )
+        with pytest.raises(OSError):
+            list(ds)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except _sp.TimeoutExpired:
+            proc.kill()
+            proc.wait()

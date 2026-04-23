@@ -727,7 +727,6 @@ fn serve_inner(args: cli::ServeArgs) -> shuflr::Result<()> {
         ));
     }
     if grpc.is_some() {
-        // PR-35 wires this; reject now so we don't silently no-op.
         return Err(shuflr::Error::Input(
             "--grpc is reserved for PR-35; not yet wired".into(),
         ));
@@ -740,8 +739,49 @@ fn serve_inner(args: cli::ServeArgs) -> shuflr::Result<()> {
         shuflr::Error::Input(format!("invalid --http address '{http_addr_str}': {e}"))
     })?;
 
-    let _ = args.bind_public; // PR-31 wires this
-    let cfg = shuflr::serve::HttpConfig::new(http_addr, catalog)?;
+    // Cross-flag validation. The HttpConfig builder catches the
+    // subset that depends only on resolved config; we run here for
+    // errors that depend on CLI-shape (e.g. --tls-cert without
+    // --tls-key).
+    if args.tls_cert.is_some() ^ args.tls_key.is_some() {
+        return Err(shuflr::Error::Input(
+            "--tls-cert and --tls-key must be given together".into(),
+        ));
+    }
+    if args.tls_client_ca.is_some() && args.tls_cert.is_none() {
+        return Err(shuflr::Error::Input(
+            "--tls-client-ca requires --tls-cert/--tls-key".into(),
+        ));
+    }
+
+    let auth = match args.auth {
+        cli::AuthKind::None => shuflr::serve::Auth::None,
+        cli::AuthKind::Bearer => {
+            let path = args.auth_tokens.clone().ok_or_else(|| {
+                shuflr::Error::Input("--auth=bearer requires --auth-tokens <PATH>".into())
+            })?;
+            shuflr::serve::Auth::bearer_from_file(path)?
+        }
+        cli::AuthKind::Mtls => shuflr::serve::Auth::Mtls,
+    };
+
+    let tls = match (args.tls_cert.clone(), args.tls_key.clone()) {
+        (Some(cert), Some(key)) => Some(shuflr::serve::http::TlsPaths {
+            cert,
+            key,
+            client_ca: args.tls_client_ca.clone(),
+        }),
+        _ => None,
+    };
+
+    let mut builder = shuflr::serve::HttpConfig::builder(http_addr, catalog)
+        .bind_public(args.bind_public)
+        .insecure_public(args.insecure_public)
+        .auth(auth);
+    if let Some(paths) = tls {
+        builder = builder.tls(paths);
+    }
+    let cfg = builder.build()?;
 
     // Spin up a multi-thread runtime. We serve arbitrarily many
     // concurrent streams; each stream's sync-core work lives on
@@ -752,7 +792,6 @@ fn serve_inner(args: cli::ServeArgs) -> shuflr::Result<()> {
         .map_err(shuflr::Error::Io)?;
     rt.block_on(async move {
         let shutdown = async {
-            // SIGINT → clean shutdown.
             let _ = tokio::signal::ctrl_c().await;
             tracing::info!("serve: SIGINT received, shutting down");
         };
