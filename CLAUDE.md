@@ -80,7 +80,7 @@ Two crates, not four. The library `shuflr` contains all engine modules (`shuffle
 
 ## Current status
 
-Through PR-4: CLI dispatch, `--shuffle=none` passthrough, streaming decompression for `.gz` / `.zst` / `.bz2` / `.xz`, and `shuflr convert` producing record-aligned zstd-seekable output with a trailing seek table per Facebook's spec. `shuflr info` reads the seek table in < 10 ms and summarizes frames/ratio/size distribution. Output files are decodable by any standard zstd reader (`zstdcat out.jsonl.zst` round-trips to byte-identical input); `shuflr info` additionally surfaces the per-frame structure. Single-threaded convert throughput: 232 MB/s on real EDGAR records (zstd level 3, 2 MiB frames, XXH64 checksums). Multi-threaded convert is PR-5; the seekable reader + `--shuffle=chunk-shuffled` on `.zst` is PR-7. 66 tests green. Next: PR-5 — multithreaded convert, `--verify`, and multi-input merge.
+Through PR-5: CLI dispatch, `--shuffle=none` passthrough, `--shuffle=buffer:K` local shuffle, transparent streaming decompression for `.gz` / `.zst` / `.bz2` / `.xz`, and `shuflr convert` → record-aligned zstd-seekable output (trailing seek table per Facebook's spec, median frame 2.09 MiB on real EDGAR records). `shuflr info` reads the seek table in < 10 ms. Buffer shuffle is deterministic by `--seed`, emits every record exactly once, preserves multisets, and runs at 829 MB/s on zstd-decoded EDGAR records. 76 tests green. Next: PR-6 — seekable-zstd reader and chunk-shuffled on `.zst` (the "convert once, shuffle forever" payoff).
 
 ## Upstream
 

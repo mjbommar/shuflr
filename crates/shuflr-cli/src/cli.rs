@@ -140,6 +140,10 @@ pub struct StreamArgs {
     #[arg(long, default_value = "16MiB", value_parser = parse_bytes, value_name = "BYTES")]
     pub max_line: u64,
 
+    /// Ring size for --shuffle=buffer (displacement bound)
+    #[arg(long, default_value_t = 100_000, value_name = "K")]
+    pub buffer_size: u64,
+
     /// Progress bar visibility
     #[arg(long, value_enum, default_value_t = When::Auto, value_name = "WHEN")]
     pub progress: When,

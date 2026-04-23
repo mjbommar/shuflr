@@ -367,6 +367,88 @@ fn convert_rejects_multi_input_in_pr4() {
 }
 
 #[test]
+fn stream_buffer_preserves_record_multiset_and_is_deterministic() {
+    let input_content: String = (0..200).map(|i| format!("record_{i:03}\n")).collect();
+
+    let run_once = |seed: &str| {
+        let assert = shuflr()
+            .args([
+                "stream",
+                "--shuffle",
+                "buffer",
+                "--buffer-size",
+                "32",
+                "--seed",
+                seed,
+                "--log-level",
+                "warn",
+            ])
+            .write_stdin(input_content.clone())
+            .assert()
+            .success();
+        String::from_utf8(assert.get_output().stdout.clone()).unwrap()
+    };
+
+    let out_a = run_once("42");
+    let out_b = run_once("42");
+    assert_eq!(out_a, out_b, "same seed must produce byte-identical output");
+
+    let out_c = run_once("43");
+    assert_ne!(
+        out_a, out_c,
+        "different seeds must produce different orderings"
+    );
+
+    // Multisets must match the input.
+    let mut input_lines: Vec<&str> = input_content.lines().collect();
+    let mut out_lines: Vec<&str> = out_a.lines().collect();
+    input_lines.sort_unstable();
+    out_lines.sort_unstable();
+    assert_eq!(input_lines, out_lines);
+    // And some actual reordering happened — not identity.
+    assert_ne!(out_a, input_content);
+}
+
+#[test]
+fn stream_buffer_on_gzip_input_works() {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("data.jsonl.gz");
+    let records: String = (0..50).map(|i| format!("rec_{i:02}\n")).collect();
+    let mut enc = GzEncoder::new(
+        std::fs::File::create(&path).unwrap(),
+        Compression::default(),
+    );
+    enc.write_all(records.as_bytes()).unwrap();
+    enc.finish().unwrap();
+
+    let assert = shuflr()
+        .args([
+            "stream",
+            "--shuffle",
+            "buffer",
+            "--buffer-size",
+            "16",
+            "--seed",
+            "7",
+            "--log-level",
+            "warn",
+        ])
+        .arg(&path)
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let mut in_sorted: Vec<&str> = records.lines().collect();
+    let mut out_sorted: Vec<&str> = out.lines().collect();
+    in_sorted.sort_unstable();
+    out_sorted.sort_unstable();
+    assert_eq!(in_sorted, out_sorted);
+}
+
+#[test]
 fn convert_preserves_crlf_and_nul() {
     let tmp = tempfile::tempdir().unwrap();
     let input_path = tmp.path().join("in.jsonl");

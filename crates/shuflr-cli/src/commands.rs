@@ -131,19 +131,106 @@ fn report_library_error(e: &shuflr::Error) -> exit::Code {
     }
 }
 
-/// Route non-`None` shuffle modes to the stream handler; others stub out.
+/// Route supported shuffle modes to their handlers; others stub out.
 pub fn stream_dispatch(args: cli::StreamArgs) -> exit::Code {
-    if args.shuffle == cli::ShuffleMode::None {
-        return stream(args);
-    }
-    stub(
-        "stream",
-        format!(
-            "--shuffle={:?} is not yet implemented. PR-2 ships --shuffle=none; \
-             see docs/design/002 §2 and 004 §9 for the roadmap.",
-            args.shuffle
+    match args.shuffle {
+        cli::ShuffleMode::None => stream(args),
+        cli::ShuffleMode::Buffer => match stream_buffer_inner(args) {
+            Ok(()) => exit::Code::Ok,
+            Err(e) => report_library_error(&e),
+        },
+        other => stub(
+            "stream",
+            format!(
+                "--shuffle={other:?} is not yet implemented. Supported modes so far: \
+                 none, buffer. See docs/design/002 §2 and 004 §9 for the roadmap."
+            ),
         ),
-    )
+    }
+}
+
+fn stream_buffer_inner(args: cli::StreamArgs) -> shuflr::Result<()> {
+    if args.input.inputs.len() > 1 {
+        tracing::warn!(
+            "PR-5 concatenates multiple inputs for --shuffle=buffer; chunked modes land in PR-7"
+        );
+    }
+    let total_start = Instant::now();
+    let stdout = io::stdout();
+    let mut sink = stdout.lock();
+    let mut total = shuflr::Stats::default();
+
+    let buffer_size = usize::try_from(args.buffer_size).map_err(|_| {
+        shuflr::Error::Input(format!(
+            "--buffer-size {} too large for this build",
+            args.buffer_size
+        ))
+    })?;
+    if buffer_size == 0 {
+        return Err(shuflr::Error::Input(
+            "--buffer-size must be at least 1".into(),
+        ));
+    }
+
+    // Default seed (if the user didn't pass --seed) is 0. Log it so the run
+    // is reproducible after the fact.
+    let seed = args.seed.unwrap_or(0);
+    if args.seed.is_none() {
+        tracing::info!(seed, "no --seed given; using default");
+    }
+
+    for path in &args.input.inputs {
+        let input = shuflr::io::Input::open(path)?;
+        tracing::info!(
+            path = %path.display(),
+            bytes = input.size_hint().unwrap_or(0),
+            raw_format = ?input.raw_format(),
+            buffer_size,
+            seed,
+            "opened input (buffer-shuffle)",
+        );
+
+        let cfg = shuflr::pipeline::BufferConfig {
+            buffer_size,
+            seed,
+            max_line: args.max_line,
+            on_error: args.on_error.into(),
+            sample: remaining_sample(args.sample, &total),
+            ensure_trailing_newline: true,
+        };
+
+        let started = Instant::now();
+        let stats = shuflr::pipeline::buffer(input, &mut sink, &cfg)?;
+        let elapsed = started.elapsed();
+        tracing::info!(
+            path = %path.display(),
+            records_in = stats.records_in,
+            records_out = stats.records_out,
+            bytes_in = stats.bytes_in,
+            bytes_out = stats.bytes_out,
+            throughput_mb_s = mbs(stats.bytes_in, elapsed),
+            elapsed_ms = elapsed.as_millis() as u64,
+            "buffer-shuffle finished input",
+        );
+        accumulate(&mut total, &stats);
+        if let Some(cap) = args.sample
+            && total.records_out >= cap
+        {
+            break;
+        }
+    }
+
+    let elapsed = total_start.elapsed();
+    tracing::info!(
+        records_in = total.records_in,
+        records_out = total.records_out,
+        throughput_mb_s = mbs(total.bytes_in, elapsed),
+        elapsed_ms = elapsed.as_millis() as u64,
+        "buffer-shuffle done",
+    );
+
+    sink.flush().map_err(shuflr::Error::Io)?;
+    Ok(())
 }
 
 #[cfg(feature = "grpc")]
