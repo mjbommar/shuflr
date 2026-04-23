@@ -586,6 +586,54 @@ fn info_json_mode_parses_cleanly() {
 }
 
 #[test]
+fn index_perm_zstd_parallel_emit_matches_sequential() {
+    // PR-27: --emit-threads parallelizes the emit phase. Output must
+    // remain byte-identical across any thread count for the same seed.
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = tmp.path().join("in.jsonl");
+    let seekable = tmp.path().join("in.jsonl.zst");
+    let records: Vec<String> = (0..800).map(|i| format!("{{\"i\":{i:03}}}\n")).collect();
+    std::fs::write(&plain, records.concat()).unwrap();
+
+    shuflr()
+        .args(["convert", "--log-level", "warn", "-o"])
+        .arg(&seekable)
+        .arg(&plain)
+        .assert()
+        .success();
+
+    let run = |emit_threads: &str, prefetch: &str| {
+        let out = shuflr()
+            .args([
+                "stream",
+                "--shuffle",
+                "index-perm",
+                "--seed",
+                "42",
+                "--emit-threads",
+                emit_threads,
+                "--emit-prefetch",
+                prefetch,
+                "--log-level",
+                "warn",
+            ])
+            .arg(&seekable)
+            .assert()
+            .success();
+        String::from_utf8(out.get_output().stdout.clone()).unwrap()
+    };
+
+    let seq = run("1", "32");
+    let par2 = run("2", "4");
+    let par8 = run("4", "64");
+    assert_eq!(seq, par2, "2-thread emit must match sequential");
+    assert_eq!(
+        seq, par8,
+        "4-thread + larger prefetch must match sequential"
+    );
+}
+
+#[test]
 fn index_perm_zstd_parallel_build_matches_sequential() {
     // Same seed, same input, different --build-threads => byte-identical
     // output. Pins the PR-26 invariant that parallelism is a pure

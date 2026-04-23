@@ -48,6 +48,16 @@ pub struct Config {
     /// Worker threads for the cold index-build. 0 = physical cores
     /// (default), 1 = sequential fallback. Ignored on a sidecar-hit.
     pub build_threads: usize,
+    /// Worker threads for the emit phase (frame decode per record).
+    /// 0 = physical cores, 1 = sequential (the old LRU-cache path).
+    /// Non-sequential runs use a prefetch pipeline: main submits
+    /// `(position, frame_id)` jobs, workers decompress ahead, main
+    /// emits in shuffle order from a reorder buffer.
+    pub emit_threads: usize,
+    /// How many positions ahead the prefetch pipeline may look. Caps
+    /// in-flight decoded frames so RSS stays bounded on a uniform
+    /// permutation. Ignored for `emit_threads == 1`.
+    pub emit_prefetch: usize,
 }
 
 impl std::fmt::Debug for Config {
@@ -61,6 +71,8 @@ impl std::fmt::Debug for Config {
             .field("partition", &self.partition)
             .field("on_build_frame", &self.on_build_frame.is_some())
             .field("build_threads", &self.build_threads)
+            .field("emit_threads", &self.emit_threads)
+            .field("emit_prefetch", &self.emit_prefetch)
             .finish()
     }
 }
@@ -76,6 +88,8 @@ impl Default for Config {
             partition: None,
             on_build_frame: None,
             build_threads: 0,
+            emit_threads: 1,
+            emit_prefetch: 32,
         }
     }
 }
@@ -202,10 +216,48 @@ pub fn run(path: &Path, sink: impl Write, cfg: &Config) -> Result<(Stats, RunMet
             .collect()
     };
 
+    if cfg.emit_threads == 1 {
+        emit_sequential(
+            path,
+            &index,
+            &my_perm,
+            cfg,
+            &mut reader,
+            &mut writer,
+            &mut stats,
+            &mut metrics,
+        )?;
+    } else {
+        emit_parallel(
+            path,
+            &index,
+            &my_perm,
+            cfg,
+            &mut writer,
+            &mut stats,
+            &mut metrics,
+        )?;
+    }
+
+    writer.flush().map_err(Error::Io)?;
+    Ok((stats, metrics))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_sequential(
+    _path: &Path,
+    index: &RecordIndex,
+    my_perm: &[u32],
+    cfg: &Config,
+    reader: &mut SeekableReader,
+    writer: &mut BufWriter<impl Write>,
+    stats: &mut Stats,
+    metrics: &mut RunMetrics,
+) -> Result<()> {
     let mut cache = FrameCache::new(cfg.cache_capacity);
-    for &idx in &my_perm {
+    for &idx in my_perm {
         let loc = &index.entries[idx as usize];
-        let frame = cache.get(&mut reader, loc.frame_id)?;
+        let frame = cache.get(reader, loc.frame_id)?;
         let start = loc.offset_in_frame as usize;
         let end = start + loc.length as usize;
         let rec = &frame[start..end];
@@ -229,8 +281,168 @@ pub fn run(path: &Path, sink: impl Write, cfg: &Config) -> Result<(Stats, RunMet
 
     metrics.cache_hits = cache.hits;
     metrics.cache_misses = cache.misses;
-    writer.flush().map_err(Error::Io)?;
-    Ok((stats, metrics))
+    Ok(())
+}
+
+/// Parallel emit: prefetch-pipeline variant. Main submits
+/// `(position, frame_id)` jobs to a bounded pool; workers open their
+/// own File handles, `pread + decompress`, return
+/// `(position, Arc<Vec<u8>>)` via an unbounded result channel. Main
+/// uses a HashMap reorder buffer keyed by position so records leave in
+/// the original shuffle order.
+///
+/// Prefetch depth bounds in-flight decoded frames. On a truly uniform
+/// permutation over EDGAR (~2 MiB median frame), `emit_prefetch=32`
+/// is ~64 MiB of RAM. Large single-record frames (up to 427 MiB on
+/// EDGAR) can briefly spike RSS — same risk the sequential path
+/// already carries.
+fn emit_parallel(
+    path: &Path,
+    index: &RecordIndex,
+    my_perm: &[u32],
+    cfg: &Config,
+    writer: &mut BufWriter<impl Write>,
+    stats: &mut Stats,
+    _metrics: &mut RunMetrics,
+) -> Result<()> {
+    use crossbeam_channel::{bounded, unbounded};
+    use std::io::{Read, Seek, SeekFrom};
+    use std::sync::Arc;
+
+    // Open one reader-like channel of (offset, comp_size) per worker.
+    // We reuse SeekableReader's seek-table parsing to get those.
+    let reader = SeekableReader::open(path)?;
+    let table_entries = reader.entries().to_vec();
+    let mut offsets = Vec::with_capacity(table_entries.len() + 1);
+    let mut acc: u64 = 0;
+    for e in &table_entries {
+        offsets.push(acc);
+        acc += u64::from(e.compressed_size);
+    }
+    offsets.push(acc);
+    drop(reader);
+
+    let n = my_perm.len();
+    let threads = if cfg.emit_threads == 0 {
+        num_cpus::get_physical().max(1)
+    } else {
+        cfg.emit_threads
+    };
+    let prefetch = cfg.emit_prefetch.max(threads).max(1);
+
+    let (job_tx, job_rx) = bounded::<(usize, u32)>(prefetch);
+    let (done_tx, done_rx) = unbounded::<(usize, Arc<Vec<u8>>)>();
+    let offsets_ref = &offsets;
+    let table_entries_ref = &table_entries;
+
+    let result: Result<()> = std::thread::scope(|s| -> Result<()> {
+        let worker_handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let rx = job_rx.clone();
+                let tx = done_tx.clone();
+                s.spawn(move || -> Result<()> {
+                    let mut file = std::fs::File::open(path).map_err(Error::Io)?;
+                    while let Ok((pos, frame_id)) = rx.recv() {
+                        let offset = offsets_ref[frame_id as usize];
+                        let comp_size =
+                            table_entries_ref[frame_id as usize].compressed_size as usize;
+                        file.seek(SeekFrom::Start(offset)).map_err(Error::Io)?;
+                        let mut comp = vec![0u8; comp_size];
+                        file.read_exact(&mut comp).map_err(Error::Io)?;
+                        let bytes = zstd::stream::decode_all(&comp[..]).map_err(Error::Io)?;
+                        if tx.send((pos, Arc::new(bytes))).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        drop(done_tx);
+
+        // Fill initial prefetch window.
+        let mut submitted: usize = 0;
+        let stop_at = n; // upper bound; will shrink if --sample trips
+        while submitted < prefetch.min(stop_at) {
+            let idx = my_perm[submitted] as usize;
+            let frame_id = index.entries[idx].frame_id;
+            if job_tx.send((submitted, frame_id)).is_err() {
+                break;
+            }
+            submitted += 1;
+        }
+
+        // Consume in shuffle order; refill as we go.
+        use std::collections::HashMap;
+        let mut buffer: HashMap<usize, Arc<Vec<u8>>> = HashMap::with_capacity(prefetch);
+        let mut sample_tripped = false;
+        for consumed in 0..stop_at {
+            let frame_bytes: Arc<Vec<u8>> = loop {
+                if let Some(b) = buffer.remove(&consumed) {
+                    break b;
+                }
+                match done_rx.recv() {
+                    Ok((pos, bytes)) => {
+                        buffer.insert(pos, bytes);
+                    }
+                    Err(_) => {
+                        return Err(Error::Input(
+                            "emit workers exited before producing all requested frames".into(),
+                        ));
+                    }
+                }
+            };
+
+            let loc = &index.entries[my_perm[consumed] as usize];
+            let start = loc.offset_in_frame as usize;
+            let end = start + loc.length as usize;
+            let rec = &frame_bytes[start..end];
+            let ends_with_nl = rec.last() == Some(&b'\n');
+            writer.write_all(rec).map_err(Error::Io)?;
+            stats.bytes_out += rec.len() as u64;
+            if !ends_with_nl && cfg.ensure_trailing_newline {
+                writer.write_all(b"\n").map_err(Error::Io)?;
+                stats.bytes_out += 1;
+            }
+            stats.records_out += 1;
+            stats.records_in += 1;
+            stats.bytes_in += rec.len() as u64;
+
+            if let Some(cap) = cfg.sample
+                && stats.records_out >= cap
+            {
+                sample_tripped = true;
+                break;
+            }
+
+            // Refill — keep the prefetch window full.
+            if submitted < n {
+                let next_idx = my_perm[submitted] as usize;
+                let next_frame_id = index.entries[next_idx].frame_id;
+                if job_tx.send((submitted, next_frame_id)).is_err() {
+                    break;
+                }
+                submitted += 1;
+            }
+        }
+        let _ = sample_tripped;
+
+        // Drain any still-in-flight results before closing the queue;
+        // otherwise workers block on send and we deadlock in join.
+        drop(job_tx);
+        drop(buffer);
+        while done_rx.recv().is_ok() {}
+
+        for h in worker_handles {
+            h.join()
+                .map_err(|_| Error::Input("emit worker panicked".into()))??;
+        }
+        Ok(())
+    });
+    result?;
+
+    // Parallel emit path doesn't consult the LRU cache.
+    Ok(())
 }
 
 #[cfg(test)]
@@ -256,6 +468,78 @@ mod tests {
         }
         w.finish().unwrap();
         tf
+    }
+
+    #[test]
+    fn parallel_emit_matches_sequential_emit() {
+        let records: Vec<String> = (0..400).map(|i| format!("rec_{i:03}\n")).collect();
+        let record_refs: Vec<&str> = records.iter().map(|s| s.as_str()).collect();
+        let tf = seekable_file(&record_refs);
+
+        let run_once = |emit_threads: usize| {
+            let mut out = Vec::new();
+            let cfg = Config {
+                seed: 99,
+                emit_threads,
+                emit_prefetch: 8,
+                ..Default::default()
+            };
+            run(tf.path(), &mut out, &cfg).unwrap();
+            out
+        };
+        let seq = run_once(1);
+        let par2 = run_once(2);
+        let par4 = run_once(4);
+        assert_eq!(seq, par2, "2-thread emit must be byte-identical to seq");
+        assert_eq!(seq, par4, "4-thread emit must be byte-identical to seq");
+    }
+
+    #[test]
+    fn parallel_emit_honors_sample_cap() {
+        let records: Vec<String> = (0..500).map(|i| format!("r{i:03}\n")).collect();
+        let record_refs: Vec<&str> = records.iter().map(|s| s.as_str()).collect();
+        let tf = seekable_file(&record_refs);
+        let mut out = Vec::new();
+        let cfg = Config {
+            seed: 3,
+            emit_threads: 4,
+            emit_prefetch: 4,
+            sample: Some(17),
+            ..Default::default()
+        };
+        let (stats, _) = run(tf.path(), &mut out, &cfg).unwrap();
+        assert_eq!(stats.records_out, 17);
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.lines().count(), 17);
+    }
+
+    #[test]
+    fn parallel_emit_respects_rank_partition() {
+        use std::collections::HashSet;
+        let records: Vec<String> = (0..320).map(|i| format!("r{i:03}\n")).collect();
+        let record_refs: Vec<&str> = records.iter().map(|s| s.as_str()).collect();
+        let tf = seekable_file(&record_refs);
+        let w = 4u32;
+        let mut seen: HashSet<String> = HashSet::new();
+        for rank in 0..w {
+            let mut out = Vec::new();
+            run(
+                tf.path(),
+                &mut out,
+                &Config {
+                    seed: 11,
+                    emit_threads: 4,
+                    emit_prefetch: 4,
+                    partition: Some((rank, w)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            for ln in String::from_utf8(out).unwrap().lines() {
+                assert!(seen.insert(ln.to_string()), "rank overlap on {ln}");
+            }
+        }
+        assert_eq!(seen.len(), 320);
     }
 
     #[test]

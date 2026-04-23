@@ -191,6 +191,43 @@ single-record frame). Users who care more about RSS than wall time can
 pin `--build-threads=1`. Otherwise the default is now 8× phys-cores,
 matching the convert path's default from PR-18.
 
+### Operation #15 — parallel record-index emit (PR-27)
+
+PR-26 parallelized the *build*; the *emit* phase (one zstd decode
+per emitted record on a uniform permutation) was still serial,
+capped by single-thread decoder throughput ≈ 3 ms/record. For a
+uniform shuffle, a small LRU cache barely helps because each frame
+is revisited only ~42× across 1.2M decodes — each revisit lands
+far after eviction.
+
+Fix: a prefetch pipeline. Main thread submits `(position, frame_id)`
+jobs into a bounded channel (depth = `--emit-prefetch`, default 32);
+N workers open their own File handles, pread + decompress, send
+`(position, Arc<Vec<u8>>)` back on an unbounded channel. Main emits
+in shuffle order from a HashMap reorder buffer, draining behind a
+moving window.
+
+Measured on the sidecar-hot seekable (30.92 GB, 1.2M records):
+
+| Sample | Sequential (`--emit-threads=1`) | Parallel (8 workers) | Speedup | RSS Δ |
+|---|---|---|---|---|
+| 1,000 | **3.57 s** | **1.50 s** | **2.38×** | +55 MiB |
+| 10,000 | **33.11 s** | **13.86 s** | **2.39×** | +280 MiB |
+
+Output byte-identical at every sample size (verified by `diff -q`
+against the sequential reference).
+
+Scaling caps well below `num_workers` because:
+1. The reorder buffer serialises emit — main is the bottleneck once
+   workers run ahead.
+2. Random-access pread on the 30 GB file fights page-cache locality.
+
+RSS grows because the prefetch window holds up to `emit_prefetch`
+decoded frames concurrently. EDGAR's largest single-record frame is
+427 MiB; a worker holding that briefly spikes RSS. Users on tight
+memory can lower `--emit-prefetch` (e.g. 4) or pin
+`--emit-threads=1` to restore the old LRU-cache path.
+
 ## Open follow-ups (updated)
 
 - **Surface `oversized_skipped` counters more loudly** — e.g. as a WARN log at end-of-run when non-zero, so users don't silently miss 100 GB of data under default settings.
@@ -199,4 +236,4 @@ matching the convert path's default from PR-18.
 - ~~Extend `index-perm` to seekable-zstd inputs (today it only works on plain .jsonl) so we can recommend it without asking users to decompress first.~~ **Done in PR-22; sidecar added in PR-23 (see §13).**
 - **Default `--threads=0` may be suboptimal on hyperthreaded CPUs.** Consider defaulting to `num_physical_cpus()` instead of `available_parallelism()` when the host reports more logical than physical cores.
 - Parallel reader path: split a seekable input file into regions, `pread` in parallel, reassemble. Would push the local-plain ceiling higher than 2.37 GB/s.
-- **Parallel frame-decode for `index-perm` on seekable-zstd emit phase.** Today each emitted record still costs one frame decode (~3–4 ms). PR-26 parallelizes the *build* phase; the *emit* phase still decodes serially. For `--sample=N` with small N that's fine (~N × 3 ms); full-uniform emit would benefit. Not yet implemented — see §14 for the build-phase win.
+- ~~**Parallel frame-decode for `index-perm` on seekable-zstd emit phase.**~~ **Done in PR-27** — see §15. 2.39× speedup at 10k sample on the 30 GB EDGAR seekable, byte-identical to sequential.

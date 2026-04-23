@@ -155,6 +155,19 @@ pub struct StreamArgs {
     #[arg(long, default_value_t = 0, value_name = "N")]
     pub build_threads: usize,
 
+    /// Worker threads for the --shuffle=index-perm emit phase on
+    /// seekable-zstd inputs. 1 = old LRU-cache path (default); higher
+    /// enables the prefetch pipeline (N workers decode frames ahead,
+    /// main emits in shuffle order from a reorder buffer). 0 = phys
+    /// cores.
+    #[arg(long, default_value_t = 1, value_name = "N")]
+    pub emit_threads: usize,
+
+    /// Look-ahead depth for parallel emit — caps in-flight decoded
+    /// frames (and thus RSS). Ignored when --emit-threads=1.
+    #[arg(long, default_value_t = 32, value_name = "K")]
+    pub emit_prefetch: usize,
+
     /// Number of records for --shuffle=reservoir (Vitter Algorithm R)
     #[arg(long, default_value_t = 10_000, value_name = "K")]
     pub reservoir_size: u64,

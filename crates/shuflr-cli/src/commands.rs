@@ -455,6 +455,8 @@ fn run_index_perm_zstd(args: cli::StreamArgs, path: &std::path::Path) -> shuflr:
                 None
             },
             build_threads: args.build_threads,
+            emit_threads: args.emit_threads,
+            emit_prefetch: args.emit_prefetch,
         };
         let started = Instant::now();
         let (stats, metrics) = shuflr::pipeline::index_perm_zstd(path, &mut sink, &cfg)?;
