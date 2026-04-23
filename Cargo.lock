@@ -3260,6 +3260,7 @@ dependencies = [
  "memmap2",
  "metrics",
  "metrics-exporter-prometheus",
+ "num_cpus",
  "opentelemetry-otlp",
  "prost",
  "rand 0.8.6",

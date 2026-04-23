@@ -154,9 +154,13 @@ pub fn run<R: Read + Send, W: Write>(
 
 fn resolve_threads(requested: usize) -> usize {
     if requested == 0 {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
+        // Physical-core count rather than `available_parallelism()` because
+        // zstd compression is compute-heavy: bench/001 showed 16-thread
+        // (SMT) is ~14% SLOWER than 8-thread on an 8P/16T Ryzen 7840HS
+        // (6.61s vs 5.79s for the same workload) due to hyperthread
+        // contention on the encoder. Users who want all logical cores
+        // can still pass --threads=16 explicitly.
+        num_cpus::get_physical().max(1)
     } else {
         requested
     }

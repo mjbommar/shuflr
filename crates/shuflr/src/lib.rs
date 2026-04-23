@@ -19,3 +19,11 @@ pub use framing::{OnError, Stats};
 pub use index::{Fingerprint, IndexFile};
 pub use sampling::SamplingReader;
 pub use seed::Seed;
+
+/// Physical CPU core count (not logical/SMT). Defaults to 1 on systems
+/// where detection fails. Preferred over `std::thread::available_parallelism`
+/// for compute-heavy workloads like zstd compression; see
+/// `docs/bench/001-edgar-31gb-gzip.md` §thread-scaling.
+pub fn physical_cores() -> usize {
+    num_cpus::get_physical().max(1)
+}

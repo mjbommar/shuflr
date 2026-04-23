@@ -768,9 +768,10 @@ fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
 
 fn resolve_threads(requested: usize) -> usize {
     if requested == 0 {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
+        // Mirror the library-side default: physical cores, not
+        // logical/SMT. See crates/shuflr/src/io/zstd_seekable/parallel.rs
+        // and docs/bench/001-edgar-31gb-gzip.md for the measurement.
+        shuflr::physical_cores()
     } else {
         requested
     }
