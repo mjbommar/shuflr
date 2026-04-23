@@ -11,9 +11,11 @@ pub mod framing;
 pub mod index;
 pub mod io;
 pub mod pipeline;
+pub mod sampling;
 pub mod seed;
 
 pub use error::{Error, Result};
 pub use framing::{OnError, Stats};
 pub use index::{Fingerprint, IndexFile};
+pub use sampling::SamplingReader;
 pub use seed::Seed;

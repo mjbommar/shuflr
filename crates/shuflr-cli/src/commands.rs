@@ -617,14 +617,54 @@ fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
     // decompressed size is unknown; we fall back to a spinner by passing `None`.
     let show_progress = progress::should_show(args.progress);
     let bar = if show_progress {
-        let total = if input.raw_format() == shuflr::io::magic::Format::Plain {
+        let total = if input.raw_format() == shuflr::io::magic::Format::Plain
+            && args.sample_rate.is_none()
+            && args.limit.is_none()
+        {
             input_size
         } else {
+            // Under filtering, output size is unknown; use a spinner.
             None
         };
         Some(progress::new_bar(total, "convert"))
     } else {
         None
+    };
+
+    // If --limit or --sample-rate is set, insert a record-level sampling
+    // filter between the (decompressed) input stream and the writer. The
+    // filter counts and filters records; the writer sees a plain stream of
+    // accepted records only.
+    let sampling_active = args.limit.is_some() || args.sample_rate.is_some();
+    if sampling_active {
+        tracing::info!(
+            limit = ?args.limit,
+            sample_rate = ?args.sample_rate,
+            seed = args.seed.unwrap_or(0),
+            "record sampling active",
+        );
+    }
+    let seed = args.seed.unwrap_or(0);
+
+    // Compose the reader stack from bottom to top:
+    //   Input  →  ProgressReader  →  SamplingReader  →  (writer input)
+    // The progress bar sees INPUT bytes (so it reflects decompressed-stream
+    // progress, which is the knob users care about), while the sampling
+    // filter trims records before they reach the writer.
+    let progress_bar = bar.clone();
+    let with_progress: Box<dyn Read + Send> = match progress_bar {
+        Some(pb) => Box::new(progress::ProgressReader::new(input, pb)),
+        None => Box::new(input),
+    };
+    let source: Box<dyn Read + Send> = if sampling_active {
+        Box::new(shuflr::SamplingReader::new(
+            with_progress,
+            args.sample_rate,
+            args.limit,
+            seed,
+        ))
+    } else {
+        with_progress
     };
 
     let started = Instant::now();
@@ -637,12 +677,7 @@ fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
             record_aligned: !args.no_record_align,
         };
         let mut writer = Writer::new(output, cfg);
-        // Wrap input in the progress reader if a bar is active.
-        let reader_source: Box<dyn Read> = match &bar {
-            Some(pb) => Box::new(progress::ProgressReader::new(input, pb.clone())),
-            None => Box::new(input),
-        };
-        let mut reader = BufReader::with_capacity(2 * 1024 * 1024, reader_source);
+        let mut reader = BufReader::with_capacity(2 * 1024 * 1024, source);
         let mut buf = vec![0u8; 2 * 1024 * 1024];
         loop {
             let n = reader.read(&mut buf).map_err(shuflr::Error::Io)?;
@@ -661,16 +696,7 @@ fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
             record_aligned: !args.no_record_align,
             threads: effective_threads,
         };
-        // Wrap input in the progress reader if a bar is active. The reader
-        // thread in convert_parallel is the throttle point; its read calls
-        // bump the bar as input bytes move through.
-        match &bar {
-            Some(pb) => {
-                let wrapped = progress::ProgressReader::new(input, pb.clone());
-                convert_parallel(wrapped, output, &cfg)?
-            }
-            None => convert_parallel(input, output, &cfg)?,
-        }
+        convert_parallel(source, output, &cfg)?
     };
     let elapsed = started.elapsed();
     if let Some(pb) = &bar {

@@ -215,6 +215,23 @@ pub struct ConvertArgs {
     #[arg(long)]
     pub verify: bool,
 
+    /// Stop after N records are written (head-sample mode). Combines with
+    /// --sample-rate: stop after N records have been accepted by the
+    /// Bernoulli filter.
+    #[arg(short = 'n', long, value_name = "N")]
+    pub limit: Option<u64>,
+
+    /// Bernoulli filter: include each input record with probability P
+    /// (0.0..=1.0). Stream-friendly — runs until EOF (or --limit).
+    /// For exactly-K uniform sampling use `shuflr stream --shuffle=reservoir`
+    /// piped into convert.
+    #[arg(long, value_name = "P", value_parser = parse_probability)]
+    pub sample_rate: Option<f64>,
+
+    /// Reproducibility seed for --sample-rate. Inherits SHUFLR_SEED if set.
+    #[arg(long, env = "SHUFLR_SEED", value_name = "U64")]
+    pub seed: Option<u64>,
+
     /// Progress bar visibility
     #[arg(long, value_enum, default_value_t = When::Auto, value_name = "WHEN")]
     pub progress: When,
@@ -330,6 +347,20 @@ pub enum InputFormat {
     Bz2,
     #[cfg(feature = "xz")]
     Xz,
+}
+
+/// Parse a probability in `[0.0, 1.0]`. Rejects values outside that range
+/// with a clear message (rather than silently clamping).
+fn parse_probability(raw: &str) -> std::result::Result<f64, String> {
+    let p: f64 = raw
+        .parse()
+        .map_err(|e| format!("invalid probability '{raw}': {e}"))?;
+    if !(0.0..=1.0).contains(&p) {
+        return Err(format!(
+            "probability {p} is outside [0.0, 1.0] (pass e.g. 0.01 for 1%)"
+        ));
+    }
+    Ok(p)
 }
 
 /// Parse a byte count like `16MiB`, `2MB`, `1024` into bytes.

@@ -80,7 +80,7 @@ Two crates, not four. The library `shuflr` contains all engine modules (`shuffle
 
 ## Current status
 
-Through PR-13: Five of six v1 shuffle modes live (`none` / `buffer:K` / `chunk-shuffled` / `index-perm` / `reservoir`; only `chunk-rr` deferred). All of: transparent streaming decompression, multi-threaded `convert --verify`, `info`, `index` with fingerprint-based sidecar reuse, `--rank R --world-size W` disjoint partitioning, indicatif progress bars, and now **`shuflr analyze`** — measures per-frame byte-distribution KL and record-length CV vs global, emits SAFE/UNSAFE verdict with a targeted recommendation. On the real EDGAR sample it correctly flags UNSAFE (byte-KL=0.23, reclen-CV=0.96) and nudges toward `index-perm`, exactly the ML-review use case. 129 tests green (81 lib unit + 3 lib integration + 4 rank-disjoint + 5 CLI unit + 36 CLI integration). Next: README / release prep, or `chunk-rr` + `shuflr verify` standalone subcommand.
+Through PR-14: Everything through PR-13 (5 shuffle modes, convert/info/index/analyze/verify, --rank/--world-size partitioning, progress bars) plus **`shuflr convert --limit N` and `--sample-rate P`** for in-line record sampling during conversion. The SamplingReader wraps any Read and applies head-limit + Bernoulli filtering before bytes reach the writer, so `shuflr convert --sample-rate=0.01 --limit=1000000 huge.jsonl.gz -o subset.jsonl.zst` works directly on a 610 GB gzip file without pre-decompressing. Deterministic by seed. 140 tests green. All five feature dimensions of 002 §2.1–2.4 now shipped: shuffle mode × compression × sampling × distributed partitioning × integrity-verify. Next: release prep, chunk-rr, standalone shuflr verify subcommand, or serve (gRPC).
 
 ## Upstream
 
