@@ -3,3 +3,4 @@ target/
 *.idx
 tests/corpora/large/
 .DS_Store
+tmp/
