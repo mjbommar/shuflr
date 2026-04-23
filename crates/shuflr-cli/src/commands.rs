@@ -271,18 +271,34 @@ fn stream_index_perm_inner(args: cli::StreamArgs) -> shuflr::Result<()> {
                 .into(),
         ));
     }
-    // Reject compressed inputs with a clear message.
+    // Routing: plain files use the old pread-based path below. Seekable
+    // zstd inputs go through the frame-decode-per-record path
+    // (pipeline::index_perm_zstd). Streaming-only compressed inputs
+    // (plain gzip, non-seekable zstd, bz2, xz) reject with the same
+    // hint as before.
     let probe = shuflr::io::Input::open(path)?;
-    if probe.raw_format() != shuflr::io::magic::Format::Plain {
+    let raw_format = probe.raw_format();
+    drop(probe);
+
+    #[cfg(feature = "zstd")]
+    {
+        if raw_format == shuflr::io::magic::Format::Zstd
+            && shuflr::io::zstd_seekable::SeekableReader::open(path).is_ok()
+        {
+            let path_owned = path.clone();
+            return run_index_perm_zstd(args, &path_owned);
+        }
+    }
+
+    if raw_format != shuflr::io::magic::Format::Plain {
         return Err(shuflr::Error::Input(format!(
             "--shuffle=index-perm needs byte-offset random access, which is not possible \
              on {} input. Decompress to '.jsonl' first, or run `shuflr convert {}` and \
-             use --shuffle=chunk-shuffled instead.",
-            probe.raw_format().name(),
+             try again (shuflr's seekable-zstd index-perm path will take over).",
+            raw_format.name(),
             path.display(),
         )));
     }
-    drop(probe);
 
     let seed = args.seed.unwrap_or(0);
     if args.seed.is_none() {
@@ -380,6 +396,69 @@ fn stream_index_perm_inner(args: cli::StreamArgs) -> shuflr::Result<()> {
         "index-perm done",
     );
     warn_if_records_dropped(&total, args.max_line);
+    sink.flush().map_err(shuflr::Error::Io)?;
+    Ok(())
+}
+
+#[cfg(feature = "zstd")]
+fn run_index_perm_zstd(args: cli::StreamArgs, path: &std::path::Path) -> shuflr::Result<()> {
+    let seed = args.seed.unwrap_or(0);
+    if args.seed.is_none() {
+        tracing::info!(seed, "no --seed given; using default");
+    }
+
+    let stdout = io::stdout();
+    let mut sink = stdout.lock();
+    let mut total = shuflr::Stats::default();
+    let epochs_cap = if args.epochs == 0 {
+        u64::MAX
+    } else {
+        args.epochs
+    };
+    let total_start = Instant::now();
+    for epoch in 0..epochs_cap {
+        let cfg = shuflr::pipeline::IndexPermZstdConfig {
+            seed,
+            epoch,
+            sample: remaining_sample(args.sample, &total),
+            ensure_trailing_newline: true,
+            cache_capacity: shuflr::pipeline::index_perm_zstd::DEFAULT_CACHE_CAPACITY,
+            partition: partition_from_args(&args),
+        };
+        let started = Instant::now();
+        let (stats, metrics) = shuflr::pipeline::index_perm_zstd(path, &mut sink, &cfg)?;
+        let elapsed = started.elapsed();
+        tracing::info!(
+            epoch,
+            records_out = stats.records_out,
+            bytes_out = stats.bytes_out,
+            index_build_ms = metrics.index_build_ms,
+            records_scanned = metrics.records_scanned,
+            cache_hits = metrics.cache_hits,
+            cache_misses = metrics.cache_misses,
+            cache_hit_rate = if metrics.cache_hits + metrics.cache_misses == 0 {
+                0.0
+            } else {
+                metrics.cache_hits as f64 / (metrics.cache_hits + metrics.cache_misses) as f64
+            },
+            throughput_mb_s = mbs(stats.bytes_in, elapsed),
+            elapsed_ms = elapsed.as_millis() as u64,
+            "index-perm (seekable-zstd) epoch done",
+        );
+        accumulate(&mut total, &stats);
+        if let Some(cap) = args.sample
+            && total.records_out >= cap
+        {
+            break;
+        }
+    }
+    let elapsed = total_start.elapsed();
+    tracing::info!(
+        records_out = total.records_out,
+        throughput_mb_s = mbs(total.bytes_in, elapsed),
+        elapsed_ms = elapsed.as_millis() as u64,
+        "index-perm (seekable-zstd) done",
+    );
     sink.flush().map_err(shuflr::Error::Io)?;
     Ok(())
 }
