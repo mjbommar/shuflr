@@ -80,7 +80,7 @@ Two crates, not four. The library `shuflr` contains all engine modules (`shuffle
 
 ## Current status
 
-Through PR-14: Everything through PR-13 (5 shuffle modes, convert/info/index/analyze/verify, --rank/--world-size partitioning, progress bars) plus **`shuflr convert --limit N` and `--sample-rate P`** for in-line record sampling during conversion. The SamplingReader wraps any Read and applies head-limit + Bernoulli filtering before bytes reach the writer, so `shuflr convert --sample-rate=0.01 --limit=1000000 huge.jsonl.gz -o subset.jsonl.zst` works directly on a 610 GB gzip file without pre-decompressing. Deterministic by seed. 140 tests green. All five feature dimensions of 002 §2.1–2.4 now shipped: shuffle mode × compression × sampling × distributed partitioning × integrity-verify. Next: release prep, chunk-rr, standalone shuflr verify subcommand, or serve (gRPC).
+Through PR-15: Everything through PR-14 (5 shuffle modes, convert/info/index/analyze/verify, --rank/--world-size partitioning, --limit/--sample-rate inline sampling, progress bars) plus **visible WARN on any silently-dropped records** (uncovered by bench/001; 16 MiB default cap was silently dropping 110 GB from real EDGAR data, now emits actionable guidance). 140 tests green. Full real-corpus benchmark in `docs/bench/001-edgar-31gb-gzip.md`: peak 2.37 GB/s convert throughput at 8 threads on 8P/16T Ryzen, full 1.2M-record chunk-shuffled in 154 s at 1.19 GB/s. Known follow-ups: physical-core thread default, parallel-pread reader, index-perm on seekable-zstd.
 
 ## Upstream
 

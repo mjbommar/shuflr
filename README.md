@@ -114,6 +114,12 @@ Measured on `sample.jsonl.zst` (1.2 GiB compressed / 5.15 GiB decompressed,
 Synthetic micro-bench (2 MiB reused buffer, `io::sink`):
 passthrough hits 5.35 GiB/s on 128 MiB × 8 KiB records.
 
+**Full-scale run on 31 GB EDGAR gzip** (`edgar-0.05.jsonl.gz`, 192.68 GB
+decompressed, 1.2M records): see `docs/bench/001-edgar-31gb-gzip.md`.
+Headline — convert peak 2.37 GB/s decompressed at 8 threads on local
+NVMe (8P/16T Ryzen 7 7840HS; 16-thread oversubscribes, 8 is optimal);
+chunk-shuffled full file in 154 s at 1.19 GB/s.
+
 ## Architecture
 
 - **`crates/shuflr`** — library: error, seed (PRF hierarchy), framing, io
