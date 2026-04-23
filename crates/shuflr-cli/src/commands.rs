@@ -88,9 +88,27 @@ fn stream_inner(args: cli::StreamArgs) -> shuflr::Result<()> {
         elapsed_ms = elapsed.as_millis() as u64,
         "done",
     );
+    warn_if_records_dropped(&total, args.max_line);
 
     sink.flush().map_err(shuflr::Error::Io)?;
     Ok(())
+}
+
+/// Emit a WARN-level tracing event when any records were silently skipped.
+/// Bench/001 found that default `--max-line=16MiB --on-error=skip` can drop
+/// 100+ GB on a real EDGAR corpus without surfacing it. This turns that
+/// into visible feedback while keeping the policy itself unchanged.
+fn warn_if_records_dropped(total: &shuflr::Stats, max_line: u64) {
+    if total.oversized_skipped > 0 {
+        tracing::warn!(
+            oversized_skipped = total.oversized_skipped,
+            max_line_bytes = max_line,
+            "dropped {} records exceeding --max-line ({} bytes). Raise --max-line \
+             or pass --on-error=passthrough to keep them",
+            total.oversized_skipped,
+            max_line,
+        );
+    }
 }
 
 fn remaining_sample(sample: Option<u64>, so_far: &shuflr::Stats) -> Option<u64> {
@@ -158,6 +176,7 @@ fn stream_reservoir_inner(args: cli::StreamArgs) -> shuflr::Result<()> {
         elapsed_ms = elapsed.as_millis() as u64,
         "reservoir done",
     );
+    warn_if_records_dropped(&total, args.max_line);
     sink.flush().map_err(shuflr::Error::Io)?;
     Ok(())
 }
@@ -360,6 +379,7 @@ fn stream_index_perm_inner(args: cli::StreamArgs) -> shuflr::Result<()> {
         elapsed_ms = elapsed.as_millis() as u64,
         "index-perm done",
     );
+    warn_if_records_dropped(&total, args.max_line);
     sink.flush().map_err(shuflr::Error::Io)?;
     Ok(())
 }
@@ -465,6 +485,7 @@ fn stream_chunk_shuffled_inner(args: cli::StreamArgs) -> shuflr::Result<()> {
         elapsed_ms = elapsed.as_millis() as u64,
         "chunk-shuffled done",
     );
+    warn_if_records_dropped(&total, args.max_line);
     sink.flush().map_err(shuflr::Error::Io)?;
     Ok(())
 }
@@ -549,6 +570,7 @@ fn stream_buffer_inner(args: cli::StreamArgs) -> shuflr::Result<()> {
         elapsed_ms = elapsed.as_millis() as u64,
         "buffer-shuffle done",
     );
+    warn_if_records_dropped(&total, args.max_line);
 
     sink.flush().map_err(shuflr::Error::Io)?;
     Ok(())
