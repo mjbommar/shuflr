@@ -319,9 +319,14 @@ where
     //   (a) the dataset is a seekable-zstd file (reader opens OK)
     //   (b) shuffle=chunk-shuffled
     //   (c) client advertised `capability_flags & 0b01` (understands raw-frame)
-    //   (d) no --sample, --rank/world_size (those break frame-level granularity)
+    //   (d) no --rank/world_size (rank partitioning is record-level,
+    //       but raw-frame emits at frame granularity — a future PR
+    //       can do frame-level rank partitioning)
     //
-    // Otherwise we fall back to plain-batch, which works everywhere.
+    // --sample IS allowed. Raw-frame ships whole frames, so we may
+    // overshoot the record cap by up to one frame's worth; the
+    // server stops as soon as the running count reaches `sample`.
+    // Users who need exact cap behaviour stick with plain-batch.
     let wants_raw_frame = (client_hello.capability_flags & 0b0000_0001) != 0;
     let seekable_ok = {
         #[cfg(feature = "zstd")]
@@ -335,7 +340,6 @@ where
     };
     let use_raw_frame = wants_raw_frame
         && open.shuffle == "chunk-shuffled"
-        && open.sample.is_none()
         && open.rank.is_none()
         && open.world_size.is_none()
         && seekable_ok;
@@ -387,6 +391,7 @@ where
             &entry.path,
             open.seed,
             0, // epoch — PR-33 only supports single-epoch runs
+            open.sample,
             &mut wr,
             &mut tx_buf,
             &mut rd,
@@ -558,6 +563,7 @@ async fn stream_raw_frames<W, R>(
     path: &std::path::Path,
     seed: u64,
     epoch: u32,
+    sample: Option<u64>,
     wr: &mut W,
     tx_buf: &mut Vec<u8>,
     rd: &mut R,
@@ -657,6 +663,16 @@ where
         // Drain inbound control frames between writes without
         // blocking: non-blocking read attempt.
         drain_control_frames_nonblocking(rd, decoder, scratch)?;
+
+        // --sample cap: raw-frame ships whole frames, so we stop as
+        // soon as the running record count reaches the cap. This may
+        // overshoot by up to `records_per_frame - 1`; clients that
+        // need an exact cap stick with plain-batch.
+        if let Some(cap) = sample
+            && total_records >= cap
+        {
+            break;
+        }
     }
     wr.flush().await.map_err(Error::Io)?;
 

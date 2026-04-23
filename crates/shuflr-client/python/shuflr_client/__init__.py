@@ -93,6 +93,13 @@ class Dataset:
     def transport(self) -> str:
         return self._native.transport
 
+    @property
+    def bytes_received(self) -> int:
+        """Application-layer bytes pulled off the socket so far. Useful
+        for wire-size comparisons across protocols (see
+        `docs/bench/002-protocols.md`)."""
+        return self._native.bytes_received
+
 
 def IterableDataset(*args, **kwargs):  # noqa: N802 — match torch naming
     """Return a ``torch.utils.data.IterableDataset`` wrapping

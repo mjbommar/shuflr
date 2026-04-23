@@ -96,8 +96,27 @@ enum Stream {
 }
 
 struct HttpStream {
-    reader: Mutex<BufReader<Box<dyn Read + Send>>>,
+    reader: Mutex<BufReader<CountingReader<Box<dyn Read + Send>>>>,
+    bytes_received: std::sync::Arc<std::sync::atomic::AtomicU64>,
     exhausted: bool,
+}
+
+/// Tiny `Read` wrapper that counts every byte that passes through.
+/// Used by the bench harness to report wire bytes without a tcpdump /
+/// psutil dep. The `bytes_received` counter is shared via `Arc` so
+/// the outer [`Dataset`] can read it without locking the BufReader.
+struct CountingReader<R: Read> {
+    inner: R,
+    counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.counter
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(n)
+    }
 }
 
 impl HttpStream {
@@ -152,6 +171,9 @@ struct WireStream {
     pending: std::collections::VecDeque<Vec<u8>>,
     scratch: Vec<u8>,
     exhausted: bool,
+    /// Bytes pulled off the socket so far. Useful for bench harnesses
+    /// measuring wire overhead without a tcpdump dep.
+    bytes_received: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 trait ReadWrite: Read + std::io::Write {}
@@ -189,7 +211,11 @@ impl WireStream {
                     }
                     continue;
                 }
-                Ok(n) => self.decoder.feed(&self.scratch[..n]),
+                Ok(n) => {
+                    self.bytes_received
+                        .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                    self.decoder.feed(&self.scratch[..n])
+                }
                 Err(e) => {
                     self.exhausted = true;
                     return Some(Err(PyIOError::new_err(format!("wire read: {e}"))));
@@ -356,6 +382,19 @@ impl Dataset {
             Transport::WireUnix => "shuflr-wire/1+unix",
         }
     }
+
+    /// Bytes read off the socket so far (excludes any TCP framing /
+    /// TLS overhead — pure application-layer bytes the client saw).
+    /// 0 before iteration starts.
+    #[getter]
+    fn bytes_received(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        match &self.stream {
+            Some(Stream::Http(s)) => s.bytes_received.load(Ordering::Relaxed),
+            Some(Stream::Wire(s)) => s.bytes_received.load(Ordering::Relaxed),
+            None => 0,
+        }
+    }
 }
 
 impl Dataset {
@@ -448,8 +487,14 @@ fn open_http(
         )));
     }
     let reader: Box<dyn Read + Send> = Box::new(resp.into_reader());
+    let bytes_received = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counting = CountingReader {
+        inner: reader,
+        counter: std::sync::Arc::clone(&bytes_received),
+    };
     Ok(HttpStream {
-        reader: Mutex::new(BufReader::with_capacity(256 * 1024, reader)),
+        reader: Mutex::new(BufReader::with_capacity(256 * 1024, counting)),
+        bytes_received,
         exhausted: false,
     })
 }
@@ -545,6 +590,7 @@ fn open_wire_tcp(
         ..Default::default()
     });
     let mut scratch = vec![0u8; 64 * 1024];
+    let bytes_received = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let server_hello = loop {
         match decoder.try_next() {
             Ok(Some(Message::ServerHello(h))) => break h,
@@ -565,6 +611,7 @@ fn open_wire_tcp(
         if n == 0 {
             return Err(PyIOError::new_err("connection closed before ServerHello"));
         }
+        bytes_received.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         decoder.feed(&scratch[..n]);
     };
     if server_hello.status != HandshakeStatus::Ok {
@@ -580,6 +627,7 @@ fn open_wire_tcp(
         pending: std::collections::VecDeque::new(),
         scratch,
         exhausted: false,
+        bytes_received,
     })
 }
 
