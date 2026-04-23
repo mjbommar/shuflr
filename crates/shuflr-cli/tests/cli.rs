@@ -586,6 +586,52 @@ fn info_json_mode_parses_cleanly() {
 }
 
 #[test]
+fn chunk_shuffled_parallel_emit_matches_sequential() {
+    // PR-28: chunk-shuffled gains --emit-threads / --emit-prefetch.
+    // Output must be byte-identical across any thread count for the
+    // same seed.
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = tmp.path().join("in.jsonl");
+    let seekable = tmp.path().join("in.jsonl.zst");
+    let records: Vec<String> = (0..800).map(|i| format!("{{\"i\":{i:03}}}\n")).collect();
+    std::fs::write(&plain, records.concat()).unwrap();
+
+    shuflr()
+        .args(["convert", "--log-level", "warn", "-o"])
+        .arg(&seekable)
+        .arg(&plain)
+        .assert()
+        .success();
+
+    let run = |threads: &str, prefetch: &str| {
+        let out = shuflr()
+            .args([
+                "stream",
+                "--shuffle",
+                "chunk-shuffled",
+                "--seed",
+                "19",
+                "--emit-threads",
+                threads,
+                "--emit-prefetch",
+                prefetch,
+                "--log-level",
+                "warn",
+            ])
+            .arg(&seekable)
+            .assert()
+            .success();
+        String::from_utf8(out.get_output().stdout.clone()).unwrap()
+    };
+
+    let seq = run("1", "8");
+    let par2 = run("2", "4");
+    let par4 = run("4", "16");
+    assert_eq!(seq, par2);
+    assert_eq!(seq, par4);
+}
+
+#[test]
 fn index_perm_zstd_parallel_emit_matches_sequential() {
     // PR-27: --emit-threads parallelizes the emit phase. Output must
     // remain byte-identical across any thread count for the same seed.

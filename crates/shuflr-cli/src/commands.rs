@@ -575,6 +575,8 @@ fn stream_chunk_shuffled_inner(args: cli::StreamArgs) -> shuflr::Result<()> {
             sample: remaining_sample(args.sample, &total),
             ensure_trailing_newline: true,
             partition: partition_from_args(&args),
+            emit_threads: args.emit_threads,
+            emit_prefetch: args.emit_prefetch,
         };
         let started = Instant::now();
         let stats = shuflr::pipeline::chunk_shuffled(reader, &mut sink, &cfg)?;

@@ -228,10 +228,38 @@ decoded frames concurrently. EDGAR's largest single-record frame is
 memory can lower `--emit-prefetch` (e.g. 4) or pin
 `--emit-threads=1` to restore the old LRU-cache path.
 
+### Operation #16 — parallel chunk-shuffled emit (PR-28)
+
+PR-27 shape reused for `--shuffle=chunk-shuffled`. Frames emit in a
+permuted-but-fixed order (`my_frames`), so reorder-buffer logic is
+trivial — workers return `(position, Arc<Vec<u8>>)`, main consumes
+in ascending position, draining each frame's records before moving to
+the next. Per-frame record-shuffle is unchanged (same per-frame RNG
+seed → byte-identical output across any thread count).
+
+Measured on `tmp/edgar-0.05.jsonl.zst` (30.92 GB, 28,695 frames):
+
+| Sample | Sequential (`emit_threads=1`) | Parallel (8 / prefetch=16) | Speedup | RSS |
+|---|---|---|---|---|
+| 30,000 | **3.13 s** | **1.77 s** | **1.77×** | 675 MiB |
+| 50,000 | **5.90 s** | **3.40 s** | **1.74×** | 703 MiB |
+
+Output byte-identical; verified in-tree by
+`parallel_emit_matches_sequential` and real-corpus `diff -q`.
+
+Scaling tops out at ~1.77× (not the full 8×) for the same reasons as
+PR-27: main-thread emit is the pipeline's serialized choke point, and
+the reorder buffer prevents workers from running far ahead. Bumping
+`--emit-prefetch` from 8 → 16 buys an extra 6% (1.66× → 1.77×) at the
+cost of ~80 MiB more RSS.
+
+Defaults stay conservative: `--emit-threads=1` (the pre-PR-28 single-
+threaded path) so no behavior change without opt-in.
+
 ## Open follow-ups (updated)
 
 - **Surface `oversized_skipped` counters more loudly** — e.g. as a WARN log at end-of-run when non-zero, so users don't silently miss 100 GB of data under default settings.
-- Add a parallel frame-decode path to `chunk-shuffled` to push past the current 1.2 GB/s ceiling on large files.
+- ~~Add a parallel frame-decode path to `chunk-shuffled` to push past the current 1.2 GB/s ceiling on large files.~~ **Done in PR-28** — see §16. 1.77× speedup at 30k sample, byte-identical.
 - Add **Jensen-Shannon divergence** + per-frame **entropy** to `analyze` — both cheap additions to the existing 256-bin histogram pipeline; JS is symmetric and bounded [0, ln 2] so thresholds transfer across corpora.
 - ~~Extend `index-perm` to seekable-zstd inputs (today it only works on plain .jsonl) so we can recommend it without asking users to decompress first.~~ **Done in PR-22; sidecar added in PR-23 (see §13).**
 - **Default `--threads=0` may be suboptimal on hyperthreaded CPUs.** Consider defaulting to `num_physical_cpus()` instead of `available_parallelism()` when the host reports more logical than physical cores.
