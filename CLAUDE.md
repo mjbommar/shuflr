@@ -80,11 +80,11 @@ Two crates, not four. The library `shuflr` contains all engine modules (`shuffle
 
 ## Current status
 
-Through PR-27. Highlights since PR-14: PR-15 (visible WARN on silently-dropped oversized records), PR-16 (wire standalone `verify`), PR-17 (`shuflr man`), PR-18 (--threads=0 → physical cores on convert), PR-19 (JS + per-frame entropy in `analyze`), PR-20 (PyTorch IterableDataset example), PR-21 (entropy filter on convert), PR-22 (`index-perm` on seekable-zstd, no plain-file scratch), PR-23 (`.shuflr-idx-zst` sidecar — 1595× cache-hot speedup), PR-24 (`analyze --json`), PR-25 (progress bar during the zstd record-index cold build), PR-26 (parallel cold-cache record-index build — 4.13× speedup, 127 s → 32 s), PR-27 (parallel emit for `--shuffle=index-perm` on seekable-zstd via prefetch pipeline — 2.39× speedup on sample=10k, byte-identical to sequential).
+Through PR-28. Highlights since PR-14: PR-15 (visible WARN on silently-dropped oversized records), PR-16 (wire standalone `verify`), PR-17 (`shuflr man`), PR-18 (--threads=0 → physical cores on convert), PR-19 (JS + per-frame entropy in `analyze`), PR-20 (PyTorch IterableDataset example), PR-21 (entropy filter on convert), PR-22 (`index-perm` on seekable-zstd, no plain-file scratch), PR-23 (`.shuflr-idx-zst` sidecar — 1595× cache-hot speedup), PR-24 (`analyze --json`), PR-25 (progress bar during the zstd record-index cold build), PR-26 (parallel cold-cache record-index build — 4.13× speedup, 127 s → 32 s), PR-27 (parallel emit for `--shuffle=index-perm` — 2.39× at 10k sample), PR-28 (parallel emit for `--shuffle=chunk-shuffled` — 1.77× at 30k sample, byte-identical).
 
-**175 tests green.** Bench in `docs/bench/001-edgar-31gb-gzip.md`: 2.37 GB/s convert at 8 threads on 8P/16T Ryzen, full 1.2M-record chunk-shuffled in 154 s at 1.19 GB/s, parallel sidecar build in 32 s, parallel-emit `index-perm --sample=10000` in 14 s (vs 33 s sequential).
+**179 tests green.** Both hot-path emit modes (`chunk-shuffled` and `index-perm` on seekable-zstd) now have prefetch-pipeline parallel variants. `--emit-threads=N --emit-prefetch=K` is shared across modes; default stays `--emit-threads=1` (no behavior change without opt-in).
 
-Known follow-ups: parallel-pread reader for convert, parallel frame-decode for `chunk-shuffled`, SIGBUS handler + `--require-immutable`, `serve` gRPC subcommand (the biggest remaining piece).
+Known follow-ups: parallel-pread reader for convert, SIGBUS handler + `--require-immutable`, `serve` gRPC subcommand (the biggest remaining piece), consistent `--log-level` across all subcommands.
 
 ## Upstream
 
