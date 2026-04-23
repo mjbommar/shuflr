@@ -19,6 +19,7 @@ const SUBCOMMAND_NAMES: &[&str] = &[
     "index",
     "verify",
     "completions",
+    "man",
     "help",
 ];
 
@@ -67,6 +68,9 @@ pub enum Command {
 
     /// Emit a shell completion script
     Completions(CompletionsArgs),
+
+    /// Emit a roff man page to stdout (redirect to e.g. /usr/local/share/man/man1/shuflr.1)
+    Man(ManArgs),
 }
 
 impl Command {
@@ -85,6 +89,7 @@ impl Command {
             Self::Index(_) => "info",
             Self::Verify(_) => "info",
             Self::Completions(_) => "warn",
+            Self::Man(_) => "warn",
         }
     }
 }
@@ -292,6 +297,13 @@ pub struct CompletionsArgs {
     /// Target shell
     #[arg(value_enum)]
     pub shell: Shell,
+}
+
+#[derive(Args, Debug)]
+pub struct ManArgs {
+    /// Subcommand to document. Omit for the top-level page.
+    #[arg(value_name = "SUBCOMMAND")]
+    pub subcommand: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]

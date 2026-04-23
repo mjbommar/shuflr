@@ -76,6 +76,43 @@ fn completions_subcommand_emits_a_script() {
 }
 
 #[test]
+fn man_emits_roff_for_top_level() {
+    let assert = shuflr().args(["man"]).assert().success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    // clap_mangen emits an .TH header and .SH sections in roff.
+    assert!(
+        out.contains(".TH"),
+        "missing roff .TH header:\n{}",
+        &out[..200.min(out.len())]
+    );
+    assert!(out.contains("shuflr"), "missing command name");
+    assert!(
+        out.contains(".SH NAME") || out.contains(r"\fBNAME\fR"),
+        "missing NAME section"
+    );
+}
+
+#[test]
+fn man_per_subcommand() {
+    let assert = shuflr().args(["man", "convert"]).assert().success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(out.contains(".TH"), "missing roff header");
+    assert!(
+        out.contains("zstd-seekable") || out.contains("frame"),
+        "convert man page doesn't mention its core concepts:\n{out}"
+    );
+}
+
+#[test]
+fn man_unknown_subcommand_errors_cleanly() {
+    shuflr()
+        .args(["man", "nonexistent"])
+        .assert()
+        .code(64) // EX_USAGE
+        .stderr(predicate::str::contains("no subcommand named"));
+}
+
+#[test]
 fn completions_supports_zsh_and_fish() {
     for shell in ["zsh", "fish"] {
         shuflr()

@@ -1233,6 +1233,31 @@ pub fn completions(args: cli::CompletionsArgs) -> exit::Code {
     exit::Code::Ok
 }
 
+pub fn man(args: cli::ManArgs) -> exit::Code {
+    use clap::CommandFactory as _;
+    let cli = cli::Cli::command();
+    let target = match args.subcommand.as_deref() {
+        None => cli,
+        Some(sub) => match cli.get_subcommands().find(|c| c.get_name() == sub).cloned() {
+            Some(c) => c,
+            None => {
+                let _ = writeln!(
+                    io::stderr(),
+                    "shuflr: no subcommand named '{sub}'. Available: stream, serve, convert, info, analyze, index, verify, completions, man",
+                );
+                return exit::Code::Usage;
+            }
+        },
+    };
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    if let Err(e) = clap_mangen::Man::new(target).render(&mut out) {
+        let _ = writeln!(io::stderr(), "shuflr: failed to render man page: {e}");
+        return exit::Code::Software;
+    }
+    exit::Code::Ok
+}
+
 fn stub(name: &'static str, pointer: String) -> exit::Code {
     let _ = writeln!(
         std::io::stderr(),

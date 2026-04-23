@@ -32,6 +32,7 @@ fn main() -> ExitCode {
         cli::Command::Index(a) => commands::index(a),
         cli::Command::Verify(a) => commands::verify(a),
         cli::Command::Completions(a) => commands::completions(a),
+        cli::Command::Man(a) => commands::man(a),
     };
     code.into()
 }
