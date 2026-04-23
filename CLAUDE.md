@@ -37,13 +37,14 @@ When reading 002, check later-numbered docs for amendments to any section you ca
 crates/
   shuflr/         # library: engine, algorithms, I/O, sinks, service (all feature-gated)
   shuflr-cli/     # binary: arg parsing, wiring (produces the `shuflr` binary)
+  shuflr-client/  # Python package (Rust + pyo3, built with maturin) — `pip install shuflr-client`
 docs/design/      # numbered design docs + review directories
 tests/corpora/    # small fixtures; large corpora are git-ignored
 deny.toml         # cargo-deny policy (licenses, advisories, sources)
 .github/workflows/ci.yml   # check + test + each-feature + deny
 ```
 
-Two crates, not four. The library `shuflr` contains all engine modules (`shuffle/`, `io/`, `sink/`, `service/`, `framing.rs`, `seed.rs`). Extracting `chunked-shuffle` as a standalone crate is a post-v1 decision (six-month stability rule).
+Three crates. `shuflr` holds all engine code; `shuflr-cli` is the binary; `shuflr-client` is the Python wheel (Rust core, HTTP transport per PR-34a; wire transport lands in PR-36). Run Python tests via `crates/shuflr-client/scripts/test.sh`.
 
 ## Conventions
 
@@ -85,7 +86,11 @@ Through PR-28. Highlights since PR-14: PR-15 (visible WARN on silently-dropped o
 
 **179 tests green.** Both hot-path emit modes (`chunk-shuffled` and `index-perm` on seekable-zstd) now have prefetch-pipeline parallel variants. `--emit-threads=N --emit-prefetch=K` is shared across modes; default stays `--emit-threads=1` (no behavior change without opt-in).
 
-Known follow-ups: `serve` subcommand per `005-serve-multi-transport.md` (PRs 30-36: HTTP → TLS/auth → wire/1 codec → wire/1 transport → `shuflr-client` Python lib → gRPC → observability). Also: parallel-pread reader for convert, SIGBUS handler + `--require-immutable`, consistent `--log-level` across all subcommands.
+Through **PR-30** + **PR-34a**: HTTP transport of `serve` shipped (loopback only, no auth). First-party Python client (`shuflr-client`) wraps it with a `Dataset` that iterates `bytes` records and an optional torch `IterableDataset` wrapper.
+
+Remaining 005 PRs: **31** TLS/auth + `--bind-public --insecure-public` — **32** `shuflr-wire` codec crate — **33** wire transport wired to serve — **34b** wire in `shuflr-client` — **35** gRPC — **36** observability.
+
+Other known follow-ups: parallel-pread reader for convert, SIGBUS handler + `--require-immutable`, consistent `--log-level` across all subcommands.
 
 ## Upstream
 

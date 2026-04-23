@@ -1,0 +1,31 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "shuflr-client"
+version = "0.0.0"
+description = "Python client for shuflr — HTTP NDJSON and (coming) shuflr-wire/1 binary transports"
+readme = "README.md"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "Michael Bommarito", email = "michael.bommarito@gmail.com" }]
+requires-python = ">=3.9"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+]
+
+[project.optional-dependencies]
+torch = ["torch"]
+test = ["pytest>=8"]
+
+[tool.maturin]
+# Python package lives under `python/shuflr_client`; the compiled
+# extension module attaches as `shuflr_client._shuflr_client_native`.
+python-source = "python"
+module-name = "shuflr_client._shuflr_client_native"
+# abi3 → one wheel for py39+.
+features = ["pyo3/extension-module"]

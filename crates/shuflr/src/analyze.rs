@@ -243,6 +243,7 @@ fn summarize(xs: &[f64]) -> (f64, f64) {
     (max, sum / xs.len() as f64)
 }
 
+#[cfg(feature = "zstd")]
 fn coefficient_of_variation(xs: &[f64]) -> f64 {
     if xs.len() < 2 {
         return 0.0;

@@ -1,0 +1,35 @@
+[package]
+name = "shuflr-client"
+description = "Python client for shuflr over HTTP / shuflr-wire / gRPC (Rust core via pyo3)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "_shuflr_client_native"
+# cdylib so maturin can build a Python extension module (.so / .pyd).
+# rlib so the tokio-agnostic integration tests can link the crate too.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# pyo3 builds the Python extension module. `abi3-py39` means we ship
+# one wheel that loads on Python 3.9+ without per-version rebuilds.
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
+# Blocking HTTP/1.1 client. No tokio, no async. One crate, few deps —
+# important for wheel size and for compatibility with PyTorch's
+# multiprocessing workers (no runtime to fork across).
+ureq = { version = "2", default-features = false, features = ["gzip"] }
+url = "2"
+thiserror = "2"
+
+[dev-dependencies]
+# Spawn a real server binary in integration tests.
+shuflr = { path = "../shuflr", features = ["serve"] }
+tempfile = "3"

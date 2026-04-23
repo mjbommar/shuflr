@@ -4,3 +4,13 @@ target/
 tests/corpora/large/
 .DS_Store
 tmp/
+
+# shuflr-client python dev workflow
+crates/shuflr-client/.venv/
+crates/shuflr-client/**/__pycache__/
+crates/shuflr-client/.pytest_cache/
+crates/shuflr-client/**/*.egg-info/
+crates/shuflr-client/dist/
+# maturin develop drops the compiled extension into the source tree
+crates/shuflr-client/python/shuflr_client/_shuflr_client_native*.so
+crates/shuflr-client/python/shuflr_client/_shuflr_client_native*.pyd

@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/shuflr",
     "crates/shuflr-cli",
+    "crates/shuflr-client",
 ]
 
 [workspace.package]
