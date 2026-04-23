@@ -83,9 +83,60 @@ recommendation: use `shuflr index` + --shuffle=index-perm
 6. **Full-file `chunk-shuffled` of 30 GB zstd runs at 1.19 GB/s decompressed** — the zstd decode + frame-order Fisher-Yates + intra-frame Fisher-Yates + writev pipeline is not CPU-bound either (0.52 cores avg). We could parallelize frame decoding (currently single-threaded) to push this higher.
 7. **EDGAR is an adversarial case for chunk-shuffled** — our cheapest signals (byte-KL per frame, record-length CV) fire at 1.61 nats / 3.97× mean respectively. This is both good news (the tool catches real clustering) and a warning for anyone training on EDGAR without a prior uniform shuffle.
 
-## Open follow-ups
+## Bench extension: local-NVMe input (isolating the NFS bottleneck)
 
-- Run the same matrix with input on **local NVMe** to isolate the NFS bottleneck (requires decompressing the 31 GB gz to a local 193 GB .jsonl once, ~5 min at 580 MB/s gz decode).
+Decompressed `edgar-0.05.jsonl.zst` via `zstdcat` to `./tmp/edgar-0.05.jsonl` on local NVMe. **Size: 192.68 GB exact, 1,199,612 records** (`wc -c` / `wc -l` confirm).
+
+**Important finding during diagnosis**: `shuflr stream --shuffle=none` on the seekable file initially produced 82 GB / 1,198,631 records — missing 981 records and 110 GB of data vs. `zstdcat`'s 192.68 GB / 1,199,612. This is not a decoder bug: it's the default `--max-line=16MiB --on-error=skip` policy silently dropping 981 oversized records averaging 112 MB each. EDGAR has some filings that large. Behavior is correct by design but poorly-surfaced for benchmarking — consider upgrading `skip` to log a count at INFO level (currently goes to the per-stats counter only).
+
+### Operation #11 — full convert from LOCAL plain JSONL (16 threads)
+
+| Metric | Value |
+|---|---|
+| Wall | **346.77 s** (5.78 min) |
+| User | 868.0 s (≈ 2.5 cores avg) |
+| Sys | 82.4 s |
+| Max RSS | 1.91 GB |
+| Input | 192.68 GB plain JSONL (local NVMe) |
+| Output | 30.92 GB zstd-seekable |
+| Throughput | 530 MB/s decompressed |
+
+**2.0× speedup over the NFS-input convert** (347 s vs 700 s). So removing NFS unblocked half the wall time. Still at 530 MB/s aggregate — the single-threaded reader + frame-splitter + drain on a 192 GB input is the next bottleneck (not NVMe itself, which sustains 3+ GB/s).
+
+### Operation #12 — thread scaling (fixed --limit=200000, local plain input)
+
+200k records ≈ 13.75 GB decompressed. Results:
+
+| Threads | Wall | User | Speedup | Efficiency | Effective throughput |
+|---|---|---|---|---|---|
+| 1 | 37.35 s | 32.66 s | 1.00× | 100% | 368 MB/s |
+| 2 | 16.61 s | 36.06 s | 2.25× | 112% | 828 MB/s |
+| 4 | 8.88 s | 37.77 s | 4.21× | 105% | **1.55 GB/s** |
+| 8 | **5.79 s** | 46.08 s | 6.45× | 81% | **2.37 GB/s** |
+| 16 | 6.61 s | 52.94 s | 5.65× | 35% | 2.08 GB/s |
+
+Key findings:
+
+- **Scaling is near-linear up through 4 threads**; ≥4× at 4 threads, 6.4× at 8 threads.
+- **16 threads is slower than 8.** The host is a Ryzen 7 7840HS (8P/16T) — hyperthreaded logical cores fight each other on compute-heavy zstd compression. For this workload, **8 threads is optimal**.
+- **Peak local pipeline throughput: 2.37 GB/s decompressed** at 8 threads. That's the "real ceiling" on this host.
+- The user-time barely scales past 4 threads (37 s → 46 s), confirming the reader/writer threads are the serialized choke point at higher thread counts.
+
+### Revised bottleneck picture
+
+| Input location | Wall | Limit |
+|---|---|---|
+| NFS gz (31 GB) | 700 s | NFS read (45-100 MB/s) |
+| Local plain (192 GB) | 347 s | Reader thread on 192 GB file |
+| Local plain, 8-thread optimum (200k records) | 5.79 s | Pipeline (~2.37 GB/s decomp) |
+
+To push past 2.37 GB/s we'd need: parallel file reads (io_uring or multi-thread pread), wait-free frame-boundary detection, or both. None are in scope for v1.
+
+## Open follow-ups (updated)
+
+- **Surface `oversized_skipped` counters more loudly** — e.g. as a WARN log at end-of-run when non-zero, so users don't silently miss 100 GB of data under default settings.
 - Add a parallel frame-decode path to `chunk-shuffled` to push past the current 1.2 GB/s ceiling on large files.
 - Add **Jensen-Shannon divergence** + per-frame **entropy** to `analyze` — both cheap additions to the existing 256-bin histogram pipeline; JS is symmetric and bounded [0, ln 2] so thresholds transfer across corpora.
 - Extend `index-perm` to seekable-zstd inputs (today it only works on plain .jsonl) so we can recommend it without asking users to decompress first.
+- **Default `--threads=0` may be suboptimal on hyperthreaded CPUs.** Consider defaulting to `num_physical_cpus()` instead of `available_parallelism()` when the host reports more logical than physical cores.
+- Parallel reader path: split a seekable input file into regions, `pread` in parallel, reassemble. Would push the local-plain ceiling higher than 2.37 GB/s.
