@@ -144,15 +144,144 @@ pub fn stream_dispatch(args: cli::StreamArgs) -> exit::Code {
             Ok(()) => exit::Code::Ok,
             Err(e) => report_library_error(&e),
         },
+        cli::ShuffleMode::IndexPerm => match stream_index_perm_inner(args) {
+            Ok(()) => exit::Code::Ok,
+            Err(e) => report_library_error(&e),
+        },
         other => stub(
             "stream",
             format!(
                 "--shuffle={other:?} is not yet implemented. Supported modes so far: \
-                 none, buffer, chunk-shuffled (seekable .zst only). See docs/design/002 \
-                 §2 and 004 §9 for the roadmap."
+                 none, buffer, chunk-shuffled, index-perm. See docs/design/002 §2 and \
+                 004 §9 for the roadmap."
             ),
         ),
     }
+}
+
+fn stream_index_perm_inner(args: cli::StreamArgs) -> shuflr::Result<()> {
+    if args.input.inputs.len() != 1 {
+        return Err(shuflr::Error::Input(
+            "--shuffle=index-perm accepts exactly one input file".into(),
+        ));
+    }
+    let path = &args.input.inputs[0];
+    if path == std::path::Path::new("-") {
+        return Err(shuflr::Error::Input(
+            "--shuffle=index-perm requires a seekable file; stdin is not seekable. \
+             Use --shuffle=buffer:K or save the stream to disk first."
+                .into(),
+        ));
+    }
+    // Reject compressed inputs with a clear message.
+    let probe = shuflr::io::Input::open(path)?;
+    if probe.raw_format() != shuflr::io::magic::Format::Plain {
+        return Err(shuflr::Error::Input(format!(
+            "--shuffle=index-perm needs byte-offset random access, which is not possible \
+             on {} input. Decompress to '.jsonl' first, or run `shuflr convert {}` and \
+             use --shuffle=chunk-shuffled instead.",
+            probe.raw_format().name(),
+            path.display(),
+        )));
+    }
+    drop(probe);
+
+    let seed = args.seed.unwrap_or(0);
+    if args.seed.is_none() {
+        tracing::info!(seed, "no --seed given; using default");
+    }
+
+    let fingerprint = shuflr::Fingerprint::from_metadata(path)?;
+    let sidecar = shuflr::index::sidecar_path(path);
+
+    // Load index if sidecar exists and its fingerprint matches; otherwise
+    // build, then save.
+    let index = match shuflr::IndexFile::load(&sidecar) {
+        Ok(loaded) if loaded.fingerprint == fingerprint => {
+            tracing::info!(index = %sidecar.display(), records = loaded.count(), "loaded existing index");
+            loaded
+        }
+        Ok(loaded) => {
+            tracing::warn!(
+                index = %sidecar.display(),
+                recorded_fp = ?loaded.fingerprint.0,
+                current_fp = ?fingerprint.0,
+                "existing index fingerprint mismatches file metadata; rebuilding",
+            );
+            let built_start = Instant::now();
+            let file = std::fs::File::open(path).map_err(shuflr::Error::Io)?;
+            let idx = shuflr::IndexFile::build(file, fingerprint)?;
+            let build_ms = built_start.elapsed().as_millis() as u64;
+            match idx.save(&sidecar) {
+                Ok(()) => {
+                    tracing::info!(index = %sidecar.display(), records = idx.count(), build_ms, "index rebuilt")
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "failed to persist rebuilt index; continuing with in-memory copy")
+                }
+            }
+            idx
+        }
+        Err(_) => {
+            let built_start = Instant::now();
+            let file = std::fs::File::open(path).map_err(shuflr::Error::Io)?;
+            let idx = shuflr::IndexFile::build(file, fingerprint)?;
+            let build_ms = built_start.elapsed().as_millis() as u64;
+            match idx.save(&sidecar) {
+                Ok(()) => {
+                    tracing::info!(index = %sidecar.display(), records = idx.count(), build_ms, "index built + saved")
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "failed to persist index; continuing with in-memory copy")
+                }
+            }
+            idx
+        }
+    };
+
+    let stdout = io::stdout();
+    let mut sink = stdout.lock();
+    let mut total = shuflr::Stats::default();
+    let epochs_cap = if args.epochs == 0 {
+        u64::MAX
+    } else {
+        args.epochs
+    };
+    let total_start = Instant::now();
+    for epoch in 0..epochs_cap {
+        let cfg = shuflr::pipeline::IndexPermConfig {
+            seed,
+            epoch,
+            sample: remaining_sample(args.sample, &total),
+            ensure_trailing_newline: true,
+        };
+        let started = Instant::now();
+        let stats = shuflr::pipeline::index_perm(path, &index, &mut sink, &cfg)?;
+        let elapsed = started.elapsed();
+        tracing::info!(
+            epoch,
+            records_out = stats.records_out,
+            bytes_out = stats.bytes_out,
+            throughput_mb_s = mbs(stats.bytes_in, elapsed),
+            elapsed_ms = elapsed.as_millis() as u64,
+            "index-perm epoch done",
+        );
+        accumulate(&mut total, &stats);
+        if let Some(cap) = args.sample
+            && total.records_out >= cap
+        {
+            break;
+        }
+    }
+    let elapsed = total_start.elapsed();
+    tracing::info!(
+        records_out = total.records_out,
+        throughput_mb_s = mbs(total.bytes_in, elapsed),
+        elapsed_ms = elapsed.as_millis() as u64,
+        "index-perm done",
+    );
+    sink.flush().map_err(shuflr::Error::Io)?;
+    Ok(())
 }
 
 #[cfg(feature = "zstd")]
@@ -599,11 +728,61 @@ pub fn analyze(_args: cli::AnalyzeArgs) -> exit::Code {
     )
 }
 
-pub fn index(_args: cli::IndexArgs) -> exit::Code {
-    stub(
-        "index",
-        "002 §2.2 (index-perm); lands with PR-8 (provably uniform mode)".into(),
-    )
+pub fn index(args: cli::IndexArgs) -> exit::Code {
+    match index_inner(args) {
+        Ok(()) => exit::Code::Ok,
+        Err(e) => report_library_error(&e),
+    }
+}
+
+fn index_inner(args: cli::IndexArgs) -> shuflr::Result<()> {
+    if args.input.inputs.len() != 1 {
+        return Err(shuflr::Error::Input(
+            "`shuflr index` accepts exactly one input file".into(),
+        ));
+    }
+    let in_path = &args.input.inputs[0];
+    if in_path == std::path::Path::new("-") {
+        return Err(shuflr::Error::Input(
+            "`shuflr index` requires a seekable file (stdin has no persistent offsets)".into(),
+        ));
+    }
+    // Reject compressed inputs; index-perm needs byte-offset random access.
+    let probe = shuflr::io::Input::open(in_path)?;
+    if probe.raw_format() != shuflr::io::magic::Format::Plain {
+        return Err(shuflr::Error::Input(format!(
+            "`shuflr index` currently only supports plain JSONL. \
+             '{}' is {}; decompress to '.jsonl' first, or convert to zstd-seekable \
+             and use --shuffle=chunk-shuffled instead.",
+            in_path.display(),
+            probe.raw_format().name(),
+        )));
+    }
+    drop(probe);
+
+    let out_path = args
+        .output
+        .unwrap_or_else(|| shuflr::index::sidecar_path(in_path));
+
+    let started = Instant::now();
+    let fingerprint = shuflr::Fingerprint::from_metadata(in_path)?;
+    let file = std::fs::File::open(in_path).map_err(shuflr::Error::Io)?;
+    let idx = shuflr::IndexFile::build(file, fingerprint)?;
+    let build_ms = started.elapsed().as_millis() as u64;
+
+    let save_start = Instant::now();
+    idx.save(&out_path)?;
+    let save_ms = save_start.elapsed().as_millis() as u64;
+
+    tracing::info!(
+        input = %in_path.display(),
+        index = %out_path.display(),
+        records = idx.count(),
+        build_ms,
+        save_ms,
+        "index built",
+    );
+    Ok(())
 }
 
 pub fn verify(_args: cli::VerifyArgs) -> exit::Code {

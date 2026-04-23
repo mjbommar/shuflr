@@ -530,6 +530,149 @@ fn stream_buffer_on_gzip_input_works() {
 }
 
 #[test]
+fn index_subcommand_builds_sidecar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("data.jsonl");
+    std::fs::write(&input, "a\nb\nc\nd\n").unwrap();
+
+    shuflr().args(["index"]).arg(&input).assert().success();
+
+    let sidecar = tmp.path().join("data.jsonl.shuflr-idx");
+    assert!(sidecar.exists(), "sidecar must be written");
+    let bytes = std::fs::read(&sidecar).unwrap();
+    // 8 magic + 1 version + 7 reserved + 32 fingerprint + 8 count + 8*(N+1) offsets
+    // For N=4: 56 + 8*5 = 96
+    assert_eq!(
+        bytes.len(),
+        96,
+        "unexpected sidecar layout: {} bytes",
+        bytes.len()
+    );
+    assert_eq!(&bytes[..8], b"SHUFLIDX");
+}
+
+#[test]
+fn stream_index_perm_builds_index_on_demand() {
+    use std::collections::BTreeSet;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("c.jsonl");
+    let records: Vec<String> = (0..200).map(|i| format!("{{\"i\":{i}}}\n")).collect();
+    std::fs::write(&input, records.concat()).unwrap();
+
+    // First run with no sidecar: shuflr builds, saves, then emits.
+    let assert_a = shuflr()
+        .args([
+            "stream",
+            "--shuffle",
+            "index-perm",
+            "--seed",
+            "17",
+            "--log-level",
+            "warn",
+        ])
+        .arg(&input)
+        .assert()
+        .success();
+    let out_a = String::from_utf8(assert_a.get_output().stdout.clone()).unwrap();
+    let sidecar = tmp.path().join("c.jsonl.shuflr-idx");
+    assert!(sidecar.exists());
+
+    // Second run should hit the sidecar path and produce byte-identical output.
+    let assert_b = shuflr()
+        .args([
+            "stream",
+            "--shuffle",
+            "index-perm",
+            "--seed",
+            "17",
+            "--log-level",
+            "warn",
+        ])
+        .arg(&input)
+        .assert()
+        .success();
+    let out_b = String::from_utf8(assert_b.get_output().stdout.clone()).unwrap();
+    assert_eq!(out_a, out_b, "same seed must give byte-identical output");
+
+    // Different seed = different order (same multiset).
+    let assert_c = shuflr()
+        .args([
+            "stream",
+            "--shuffle",
+            "index-perm",
+            "--seed",
+            "18",
+            "--log-level",
+            "warn",
+        ])
+        .arg(&input)
+        .assert()
+        .success();
+    let out_c = String::from_utf8(assert_c.get_output().stdout.clone()).unwrap();
+    assert_ne!(out_a, out_c);
+
+    let in_set: BTreeSet<&str> = records.iter().map(|s| s.trim_end()).collect();
+    let out_set: BTreeSet<&str> = out_a.lines().collect();
+    assert_eq!(in_set, out_set, "multiset preserved");
+    // And the order actually changed.
+    let original: String = records.concat();
+    assert_ne!(out_a, original);
+}
+
+#[test]
+fn stream_index_perm_rejects_compressed_input_with_hint() {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("data.jsonl.gz");
+    let mut enc = GzEncoder::new(
+        std::fs::File::create(&path).unwrap(),
+        Compression::default(),
+    );
+    enc.write_all(b"a\nb\nc\n").unwrap();
+    enc.finish().unwrap();
+
+    shuflr()
+        .args(["stream", "--shuffle", "index-perm"])
+        .arg(&path)
+        .assert()
+        .code(64) // EX_USAGE
+        .stderr(predicate::str::contains("shuflr convert"));
+}
+
+#[test]
+fn stream_index_perm_rebuilds_when_fingerprint_mismatches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("c.jsonl");
+    std::fs::write(&input, "one\ntwo\nthree\n").unwrap();
+
+    // Build once.
+    shuflr().args(["index"]).arg(&input).assert().success();
+    let sidecar = tmp.path().join("c.jsonl.shuflr-idx");
+    assert!(sidecar.exists());
+
+    // Mutate the input: now fingerprint (size/mtime) won't match.
+    std::thread::sleep(std::time::Duration::from_millis(1100)); // mtime tick
+    std::fs::write(&input, "one\ntwo\nthree\nFOUR\nFIVE\n").unwrap();
+
+    // stream --shuffle=index-perm should detect, rebuild, and still work.
+    let assert = shuflr()
+        .args(["stream", "--shuffle", "index-perm", "--seed", "1"])
+        .arg(&input)
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert_eq!(
+        out.lines().count(),
+        5,
+        "should now see all 5 records:\n{out}"
+    );
+}
+
+#[test]
 fn convert_preserves_crlf_and_nul() {
     let tmp = tempfile::tempdir().unwrap();
     let input_path = tmp.path().join("in.jsonl");

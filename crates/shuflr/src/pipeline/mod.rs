@@ -5,9 +5,11 @@
 pub mod buffer;
 #[cfg(feature = "zstd")]
 pub mod chunk_shuffled;
+pub mod index_perm;
 pub mod passthrough;
 
 pub use buffer::{Config as BufferConfig, run as buffer};
 #[cfg(feature = "zstd")]
 pub use chunk_shuffled::{Config as ChunkShuffledConfig, run as chunk_shuffled};
+pub use index_perm::{Config as IndexPermConfig, run as index_perm};
 pub use passthrough::{Config as PassthroughConfig, run as passthrough};
