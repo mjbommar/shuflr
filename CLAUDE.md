@@ -80,7 +80,7 @@ Two crates, not four. The library `shuflr` contains all engine modules (`shuffle
 
 ## Current status
 
-Through PR-10: CLI dispatch, `--shuffle={none,buffer:K,chunk-shuffled,index-perm}`, transparent streaming decompression for `.gz` / `.zst` / `.bz2` / `.xz`, multi-threaded `shuflr convert --verify` (4.56× on 16 cores), `shuflr info`, `shuflr index` with fingerprint-based sidecar reuse. **`--rank R --world-size W` produces disjoint, complete partitions across ranks on all four shuffle modes.** Verified on real EDGAR corpus: 4 ranks via `chunk-shuffled` give 24695 + 24991 + 24913 + 25400 records that sum exactly to 99999 — the non-partitioned total. 121 tests green (73 lib unit + 3 lib integration + 4 rank-disjoint property tests + 5 CLI unit + 36 CLI integration). Next: PR-11 — progress bar (indicatif), or fill in remaining shuffle modes (`reservoir`, `chunk-rr`).
+Through PR-11: CLI dispatch, `--shuffle={none,buffer:K,chunk-shuffled,index-perm,reservoir}`, transparent streaming decompression for `.gz` / `.zst` / `.bz2` / `.xz`, multi-threaded `shuflr convert --verify` (4.56× on 16 cores), `shuflr info`, `shuflr index` with fingerprint-based sidecar reuse, `--rank R --world-size W` disjoint partitioning on all shuffle modes. Five of six v1 shuffle modes live (only `chunk-rr` deferred — strictly dominated by `chunk-shuffled`). Reservoir uses Vitter Algorithm R, emits exactly K uniform-random records, runs at 1.35 GB/s on real zstd-decoded EDGAR (100k records × 5.5 GiB → 100-record sample in 3.9 s). 126 tests green. Next: PR-12 — progress bar (indicatif) for long-running convert/index runs, or `shuflr analyze`.
 
 ## Upstream
 

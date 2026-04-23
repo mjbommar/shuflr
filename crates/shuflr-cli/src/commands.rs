@@ -97,6 +97,71 @@ fn remaining_sample(sample: Option<u64>, so_far: &shuflr::Stats) -> Option<u64> 
     sample.map(|cap| cap.saturating_sub(so_far.records_out))
 }
 
+fn stream_reservoir_inner(args: cli::StreamArgs) -> shuflr::Result<()> {
+    if args.input.inputs.len() > 1 {
+        tracing::warn!("PR-11 reservoir concatenates multi-input in order");
+    }
+    let total_start = Instant::now();
+    let stdout = io::stdout();
+    let mut sink = stdout.lock();
+    let mut total = shuflr::Stats::default();
+
+    let k = usize::try_from(args.reservoir_size).map_err(|_| {
+        shuflr::Error::Input(format!(
+            "--reservoir-size {} too large for this build",
+            args.reservoir_size
+        ))
+    })?;
+    if k == 0 {
+        return Err(shuflr::Error::Input(
+            "--reservoir-size must be at least 1".into(),
+        ));
+    }
+    let seed = args.seed.unwrap_or(0);
+    if args.seed.is_none() {
+        tracing::info!(seed, "no --seed given; using default");
+    }
+
+    for path in &args.input.inputs {
+        let input = shuflr::io::Input::open(path)?;
+        tracing::info!(
+            path = %path.display(),
+            bytes = input.size_hint().unwrap_or(0),
+            raw_format = ?input.raw_format(),
+            reservoir_size = k,
+            seed,
+            "opened input (reservoir)",
+        );
+        let cfg = shuflr::pipeline::ReservoirConfig {
+            k,
+            seed,
+            max_line: args.max_line,
+            on_error: args.on_error.into(),
+            ensure_trailing_newline: true,
+            partition: partition_from_args(&args),
+        };
+        let started = Instant::now();
+        let stats = shuflr::pipeline::reservoir(input, &mut sink, &cfg)?;
+        let elapsed = started.elapsed();
+        tracing::info!(
+            records_in = stats.records_in,
+            records_out = stats.records_out,
+            throughput_mb_s = mbs(stats.bytes_in, elapsed),
+            elapsed_ms = elapsed.as_millis() as u64,
+            "reservoir finished input",
+        );
+        accumulate(&mut total, &stats);
+    }
+    let elapsed = total_start.elapsed();
+    tracing::info!(
+        records_out = total.records_out,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "reservoir done",
+    );
+    sink.flush().map_err(shuflr::Error::Io)?;
+    Ok(())
+}
+
 /// Extract the `(rank, world_size)` tuple from CLI args, if both are set.
 fn partition_from_args(args: &cli::StreamArgs) -> Option<(u32, u32)> {
     match (args.rank, args.world_size) {
@@ -155,6 +220,10 @@ pub fn stream_dispatch(args: cli::StreamArgs) -> exit::Code {
             Err(e) => report_library_error(&e),
         },
         cli::ShuffleMode::IndexPerm => match stream_index_perm_inner(args) {
+            Ok(()) => exit::Code::Ok,
+            Err(e) => report_library_error(&e),
+        },
+        cli::ShuffleMode::Reservoir => match stream_reservoir_inner(args) {
             Ok(()) => exit::Code::Ok,
             Err(e) => report_library_error(&e),
         },

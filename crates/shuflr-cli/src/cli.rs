@@ -144,6 +144,10 @@ pub struct StreamArgs {
     #[arg(long, default_value_t = 100_000, value_name = "K")]
     pub buffer_size: u64,
 
+    /// Number of records for --shuffle=reservoir (Vitter Algorithm R)
+    #[arg(long, default_value_t = 10_000, value_name = "K")]
+    pub reservoir_size: u64,
+
     /// Progress bar visibility
     #[arg(long, value_enum, default_value_t = When::Auto, value_name = "WHEN")]
     pub progress: When,
