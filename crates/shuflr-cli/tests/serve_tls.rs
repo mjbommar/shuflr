@@ -99,10 +99,13 @@ fn spawn_tls_server(dataset_path: &Path, certs: &ServerCerts, auth: Option<&Path
     let reader = BufReader::new(stderr);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        // Keep draining stderr for the life of the child — stopping
+        // mid-stream would eventually block the server on a log write.
+        let mut ready = false;
         for line in reader.lines().map_while(Result::ok) {
-            if line.contains("serve(http) bound") {
+            if !ready && line.contains("serve(http) bound") {
                 let _ = tx.send(());
-                break;
+                ready = true;
             }
         }
     });

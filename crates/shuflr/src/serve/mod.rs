@@ -15,7 +15,9 @@ pub mod auth;
 pub mod catalog;
 pub mod http;
 pub mod tls;
+pub mod wire;
 
 pub use auth::{Auth, AuthOutcome, BearerConfig};
 pub use catalog::{Catalog, DatasetEntry};
 pub use http::{HttpConfig, run as run_http};
+pub use wire::{WireConfig, run as run_wire};

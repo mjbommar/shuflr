@@ -29,6 +29,9 @@ serve = [
     "dep:tokio-rustls",
     "dep:rustls-pemfile",
     "dep:subtle",
+    "dep:shuflr-wire",
+    "dep:serde",
+    "dep:serde_json",
 ]
 # Networked service (gRPC, async runtime).
 grpc = ["dep:tonic", "dep:prost", "dep:tokio"]
@@ -79,6 +82,9 @@ rustls = { version = "0.23", optional = true, default-features = false, features
 tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["tls12", "ring"] }
 rustls-pemfile = { version = "2", optional = true }
 subtle = { version = "2", optional = true, default-features = false }
+shuflr-wire = { path = "../shuflr-wire", optional = true }
+serde = { version = "1", optional = true, features = ["derive"] }
+serde_json = { version = "1", optional = true }
 metrics = { version = "0.23", optional = true }
 metrics-exporter-prometheus = { version = "0.15", optional = true }
 opentelemetry-otlp = { version = "0.27", optional = true }

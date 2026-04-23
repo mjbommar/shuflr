@@ -189,6 +189,12 @@ pub struct ServeArgs {
     #[arg(long, value_name = "ADDR")]
     pub http: Option<String>,
 
+    /// shuflr-wire/1 binary listener (005 §2.2). Same TLS/auth
+    /// config as --http. Use with `shuflr://` or `shuflrs://` URLs
+    /// from a shuflr-client instance.
+    #[arg(long, value_name = "ADDR")]
+    pub wire: Option<String>,
+
     /// gRPC listener (PR-35). Only available with --features grpc.
     #[cfg(feature = "grpc")]
     #[arg(long, value_name = "ADDR")]

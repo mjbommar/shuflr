@@ -65,15 +65,19 @@ fn spawn_serve(datasets: &[(&str, &std::path::Path)]) -> ServeGuard {
 
     // Wait until the "bound" log line appears — that's our ready signal.
     // Timebox at 10 s so CI failures surface fast.
+    // Keep the reader alive for the life of the child: if we break out
+    // of the loop after "bound", the pipe fills once the server logs
+    // anything else and the server blocks mid-request.
     let stderr = child.stderr.take().expect("stderr");
     let reader = BufReader::new(stderr);
     let deadline = Instant::now() + Duration::from_secs(10);
     let (found_tx, found_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        let mut ready = false;
         for line in reader.lines().map_while(Result::ok) {
-            if line.contains("serve(http) bound") {
+            if !ready && line.contains("serve(http) bound") {
                 let _ = found_tx.send(());
-                break;
+                ready = true;
             }
         }
     });

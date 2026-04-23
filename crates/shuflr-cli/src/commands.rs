@@ -719,10 +719,10 @@ fn serve_inner(args: cli::ServeArgs) -> shuflr::Result<()> {
     #[cfg(not(feature = "grpc"))]
     let grpc: Option<String> = None;
 
-    if args.http.is_none() && grpc.is_none() {
+    if args.http.is_none() && args.wire.is_none() && grpc.is_none() {
         return Err(shuflr::Error::Input(
             "`shuflr serve` needs at least one listener flag; pass --http <ADDR> \
-             (and/or --grpc <ADDR> on a grpc-enabled build)"
+             and/or --wire <ADDR> (and --grpc <ADDR> on a grpc-enabled build)"
                 .into(),
         ));
     }
@@ -732,12 +732,20 @@ fn serve_inner(args: cli::ServeArgs) -> shuflr::Result<()> {
         ));
     }
     let catalog = shuflr::serve::Catalog::from_args(&args.datasets)?;
-    let Some(http_addr_str) = args.http else {
-        unreachable!("we would have rejected no-listener above");
+    let http_addr: Option<std::net::SocketAddr> = match &args.http {
+        Some(s) => Some(
+            s.parse()
+                .map_err(|e| shuflr::Error::Input(format!("invalid --http '{s}': {e}")))?,
+        ),
+        None => None,
     };
-    let http_addr: std::net::SocketAddr = http_addr_str.parse().map_err(|e| {
-        shuflr::Error::Input(format!("invalid --http address '{http_addr_str}': {e}"))
-    })?;
+    let wire_addr: Option<std::net::SocketAddr> = match &args.wire {
+        Some(s) => Some(
+            s.parse()
+                .map_err(|e| shuflr::Error::Input(format!("invalid --wire '{s}': {e}")))?,
+        ),
+        None => None,
+    };
 
     // Cross-flag validation. The HttpConfig builder catches the
     // subset that depends only on resolved config; we run here for
@@ -774,14 +782,30 @@ fn serve_inner(args: cli::ServeArgs) -> shuflr::Result<()> {
         _ => None,
     };
 
-    let mut builder = shuflr::serve::HttpConfig::builder(http_addr, catalog)
-        .bind_public(args.bind_public)
-        .insecure_public(args.insecure_public)
-        .auth(auth);
-    if let Some(paths) = tls {
-        builder = builder.tls(paths);
-    }
-    let cfg = builder.build()?;
+    let http_cfg = if let Some(addr) = http_addr {
+        let mut b = shuflr::serve::HttpConfig::builder(addr, catalog.clone())
+            .bind_public(args.bind_public)
+            .insecure_public(args.insecure_public)
+            .auth(auth.clone());
+        if let Some(paths) = tls.clone() {
+            b = b.tls(paths);
+        }
+        Some(b.build()?)
+    } else {
+        None
+    };
+    let wire_cfg = if let Some(addr) = wire_addr {
+        let mut b = shuflr::serve::WireConfig::builder(addr, catalog)
+            .bind_public(args.bind_public)
+            .insecure_public(args.insecure_public)
+            .auth(auth);
+        if let Some(paths) = tls {
+            b = b.tls(paths);
+        }
+        Some(b.build()?)
+    } else {
+        None
+    };
 
     // Spin up a multi-thread runtime. We serve arbitrarily many
     // concurrent streams; each stream's sync-core work lives on
@@ -791,11 +815,55 @@ fn serve_inner(args: cli::ServeArgs) -> shuflr::Result<()> {
         .build()
         .map_err(shuflr::Error::Io)?;
     rt.block_on(async move {
-        let shutdown = async {
+        // Shared shutdown future: broadcast Ctrl-C to both listeners.
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+        let ctrl_c_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
             tracing::info!("serve: SIGINT received, shutting down");
-        };
-        shuflr::serve::run_http(cfg, shutdown).await
+            let _ = ctrl_c_tx.send(());
+        });
+
+        let mut tasks = Vec::new();
+        if let Some(cfg) = http_cfg {
+            let mut rx = shutdown_tx.subscribe();
+            tasks.push(tokio::spawn(async move {
+                shuflr::serve::run_http(cfg, async move {
+                    let _ = rx.recv().await;
+                })
+                .await
+            }));
+        }
+        if let Some(cfg) = wire_cfg {
+            let mut rx = shutdown_tx.subscribe();
+            tasks.push(tokio::spawn(async move {
+                shuflr::serve::run_wire(cfg, async move {
+                    let _ = rx.recv().await;
+                })
+                .await
+            }));
+        }
+        // Await all listeners; first error wins, any panic propagates.
+        let mut first_err: Option<shuflr::Error> = None;
+        for t in tasks {
+            match t.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+                Err(join_err) => {
+                    return Err(shuflr::Error::Input(format!(
+                        "serve listener panicked: {join_err}"
+                    )));
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     })
 }
 

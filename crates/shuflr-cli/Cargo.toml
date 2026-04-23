@@ -58,3 +58,7 @@ zstd = "0.13"
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 rcgen = "0.13"
+# Used by the `serve_wire` integration tests to drive the wire codec
+# over tokio TCP; the main CLI brings tokio in via --features serve.
+shuflr-wire = { path = "../shuflr-wire" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros"] }

@@ -4,7 +4,11 @@
 //! Also: adversarial coverage for malformed input — truncations,
 //! corrupted xxh3, unknown kinds, too-large payloads.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::field_reassign_with_default)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::field_reassign_with_default
+)]
 
 use proptest::prelude::*;
 use shuflr_wire::{

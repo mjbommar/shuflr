@@ -1,0 +1,352 @@
+//! PR-33 integration tests for the `shuflr-wire/1` transport.
+//!
+//! Spawn the real shuflr binary with `--wire 127.0.0.1:0 ...` and
+//! drive the handshake / stream protocol from a tokio-based test
+//! client using the `shuflr-wire` codec directly. Verifies bytes over
+//! the socket match the PlainBatch-mode pipeline output record-for-
+//! record.
+
+#![cfg(feature = "serve")]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::io::{BufRead, BufReader};
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use shuflr_wire::{
+    AuthKind, ChosenMode, ClientHello, DecodeOptions, Decoder, HandshakeRole, HandshakeStatus,
+    Message, encode,
+};
+
+fn shuflr_bin() -> PathBuf {
+    assert_cmd::cargo::cargo_bin("shuflr")
+}
+
+fn pick_port() -> u16 {
+    let lst = TcpListener::bind("127.0.0.1:0").unwrap();
+    let p = lst.local_addr().unwrap().port();
+    drop(lst);
+    p
+}
+
+struct ServeGuard {
+    child: Child,
+    port: u16,
+}
+impl Drop for ServeGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_wire_server(datasets: &[(&str, &Path)], extra: &[&str]) -> ServeGuard {
+    let port = pick_port();
+    let mut cmd = Command::new(shuflr_bin());
+    cmd.arg("serve")
+        .arg("--wire")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--log-level")
+        .arg("info");
+    for (id, p) in datasets {
+        cmd.arg("--dataset").arg(format!("{id}={}", p.display()));
+    }
+    for a in extra {
+        cmd.arg(a);
+    }
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn shuflr");
+    let err = child.stderr.take().unwrap();
+    let reader = BufReader::new(err);
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Keep streaming stderr to the host test process so any handler
+    // errors from the server are visible when a test fails.
+    std::thread::spawn(move || {
+        let mut ready = false;
+        for line in reader.lines().map_while(Result::ok) {
+            if !ready && line.contains("serve(wire) bound") {
+                let _ = tx.send(());
+                ready = true;
+            }
+            eprintln!("[serve] {line}");
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if Instant::now() > deadline {
+            panic!("wire server never bound");
+        }
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(()) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Ok(Some(s)) = child.try_wait() {
+                    panic!("server exited early: {s:?}");
+                }
+            }
+            Err(_) => panic!("stderr disconnected"),
+        }
+    }
+    ServeGuard { child, port }
+}
+
+/// Drive one handshake + stream from `127.0.0.1:port` using tokio,
+/// collect all records, return them as a sorted list.
+fn fetch_records(
+    port: u16,
+    open_stream_json: &str,
+    auth: &[u8],
+    auth_kind: AuthKind,
+) -> Vec<Vec<u8>> {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        // ClientHello.
+        let hello = Message::ClientHello(ClientHello {
+            capability_flags: 0b111,
+            auth_kind,
+            auth: auth.to_vec(),
+            open_stream: open_stream_json.as_bytes().to_vec(),
+        });
+        s.write_all(&encode(&hello)).await.unwrap();
+        s.flush().await.unwrap();
+
+        // Read until StreamClosed or StreamError.
+        let mut d = Decoder::new(DecodeOptions {
+            role: HandshakeRole::ExpectServerHello,
+            ..Default::default()
+        });
+        let mut scratch = vec![0u8; 64 * 1024];
+        let mut out = Vec::new();
+        let mut got_hello = false;
+        loop {
+            let n = s.read(&mut scratch).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            d.feed(&scratch[..n]);
+            loop {
+                let msg = match d.try_next() {
+                    Ok(Some(m)) => m,
+                    Ok(None) => break,
+                    Err(e) => panic!("decode: {e}"),
+                };
+                match msg {
+                    Message::ServerHello(h) => {
+                        got_hello = true;
+                        if h.status != HandshakeStatus::Ok {
+                            let detail = String::from_utf8_lossy(&h.stream_opened);
+                            panic!("server rejected: {detail}");
+                        }
+                        assert_eq!(h.chosen_mode, Some(ChosenMode::PlainBatch));
+                    }
+                    Message::PlainBatch(batch) => {
+                        out.extend(batch.records);
+                    }
+                    Message::EpochBoundary { .. } => {}
+                    Message::StreamClosed { .. } => {
+                        return out;
+                    }
+                    Message::StreamError {
+                        code,
+                        fatal,
+                        detail,
+                    } => {
+                        panic!(
+                            "server StreamError {code:?} fatal={fatal} detail={}",
+                            String::from_utf8_lossy(&detail)
+                        );
+                    }
+                    other => panic!("unexpected server message {other:?}"),
+                }
+            }
+        }
+        assert!(got_hello, "server never sent hello");
+        out
+    })
+}
+
+#[test]
+fn wire_roundtrip_plain_batch_with_none_shuffle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("c.jsonl");
+    let records: Vec<String> = (0..25).map(|i| format!("{{\"i\":{i:02}}}")).collect();
+    std::fs::write(&ds, records.join("\n") + "\n").unwrap();
+    let g = spawn_wire_server(&[("corpus", &ds)], &[]);
+
+    let got = fetch_records(
+        g.port,
+        r#"{"dataset_id":"corpus","seed":0,"shuffle":"none"}"#,
+        b"",
+        AuthKind::None,
+    );
+    let mut got_str: Vec<String> = got
+        .into_iter()
+        .map(|r| String::from_utf8(r).unwrap())
+        .collect();
+    got_str.sort();
+    let mut want = records;
+    want.sort();
+    assert_eq!(got_str, want);
+}
+
+#[test]
+fn wire_roundtrip_buffer_preserves_multiset() {
+    use std::collections::BTreeSet;
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("c.jsonl");
+    let records: Vec<String> = (0..200).map(|i| format!("{{\"i\":{i:03}}}")).collect();
+    std::fs::write(&ds, records.join("\n") + "\n").unwrap();
+    let g = spawn_wire_server(&[("corpus", &ds)], &[]);
+
+    let got = fetch_records(
+        g.port,
+        r#"{"dataset_id":"corpus","seed":7,"shuffle":"buffer","max_batch_records":32}"#,
+        b"",
+        AuthKind::None,
+    );
+    let got_set: BTreeSet<String> = got
+        .into_iter()
+        .map(|r| String::from_utf8(r).unwrap())
+        .collect();
+    let want_set: BTreeSet<String> = records.into_iter().collect();
+    assert_eq!(got_set, want_set);
+}
+
+#[test]
+fn wire_sample_caps_record_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("c.jsonl");
+    std::fs::write(&ds, (0..500).map(|i| format!("r{i}\n")).collect::<String>()).unwrap();
+    let g = spawn_wire_server(&[("corpus", &ds)], &[]);
+    let got = fetch_records(
+        g.port,
+        r#"{"dataset_id":"corpus","seed":0,"shuffle":"none","sample":17}"#,
+        b"",
+        AuthKind::None,
+    );
+    assert_eq!(got.len(), 17);
+}
+
+#[test]
+fn wire_unknown_dataset_is_rejected_in_handshake() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("c.jsonl");
+    std::fs::write(&ds, "x\n").unwrap();
+    let g = spawn_wire_server(&[("real", &ds)], &[]);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let detail = rt.block_on(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", g.port))
+            .await
+            .unwrap();
+        let hello = Message::ClientHello(ClientHello {
+            capability_flags: 0,
+            auth_kind: AuthKind::None,
+            auth: vec![],
+            open_stream: br#"{"dataset_id":"missing"}"#.to_vec(),
+        });
+        s.write_all(&encode(&hello)).await.unwrap();
+        s.flush().await.unwrap();
+        let mut d = Decoder::new(DecodeOptions {
+            role: HandshakeRole::ExpectServerHello,
+            ..Default::default()
+        });
+        let mut scratch = vec![0u8; 8192];
+        loop {
+            let n = s.read(&mut scratch).await.unwrap();
+            if n == 0 {
+                panic!("server closed before sending hello");
+            }
+            d.feed(&scratch[..n]);
+            if let Some(Message::ServerHello(h)) = d.try_next().unwrap() {
+                assert_eq!(h.status, HandshakeStatus::Error);
+                return String::from_utf8_lossy(&h.stream_opened).into_owned();
+            }
+        }
+    });
+    assert!(
+        detail.contains("unknown dataset"),
+        "unexpected detail: {detail}"
+    );
+}
+
+#[test]
+fn wire_bearer_auth_accepts_right_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("c.jsonl");
+    std::fs::write(&ds, "a\nb\n").unwrap();
+    let tok = tmp.path().join("tokens.txt");
+    std::fs::write(&tok, "secret\n").unwrap();
+    let g = spawn_wire_server(
+        &[("c", &ds)],
+        &["--auth", "bearer", "--auth-tokens", tok.to_str().unwrap()],
+    );
+
+    // Right token → Ok.
+    let got = fetch_records(
+        g.port,
+        r#"{"dataset_id":"c","seed":0,"shuffle":"none"}"#,
+        b"secret",
+        AuthKind::Bearer,
+    );
+    let mut got_str: Vec<_> = got
+        .into_iter()
+        .map(|b| String::from_utf8(b).unwrap())
+        .collect();
+    got_str.sort();
+    assert_eq!(got_str, vec!["a".to_string(), "b".to_string()]);
+}
+
+#[test]
+fn wire_bearer_auth_rejects_wrong_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("c.jsonl");
+    std::fs::write(&ds, "a\nb\n").unwrap();
+    let tok = tmp.path().join("tokens.txt");
+    std::fs::write(&tok, "secret\n").unwrap();
+    let g = spawn_wire_server(
+        &[("c", &ds)],
+        &["--auth", "bearer", "--auth-tokens", tok.to_str().unwrap()],
+    );
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let detail = rt.block_on(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", g.port))
+            .await
+            .unwrap();
+        let hello = Message::ClientHello(ClientHello {
+            capability_flags: 0,
+            auth_kind: AuthKind::Bearer,
+            auth: b"wrong".to_vec(),
+            open_stream: br#"{"dataset_id":"c","shuffle":"none"}"#.to_vec(),
+        });
+        s.write_all(&encode(&hello)).await.unwrap();
+        let mut d = Decoder::new(DecodeOptions {
+            role: HandshakeRole::ExpectServerHello,
+            ..Default::default()
+        });
+        let mut scratch = vec![0u8; 8192];
+        loop {
+            let n = s.read(&mut scratch).await.unwrap();
+            if n == 0 {
+                panic!("eof before hello");
+            }
+            d.feed(&scratch[..n]);
+            if let Some(Message::ServerHello(h)) = d.try_next().unwrap() {
+                assert_eq!(h.status, HandshakeStatus::Error);
+                return String::from_utf8_lossy(&h.stream_opened).into_owned();
+            }
+        }
+    });
+    assert!(detail.contains("auth"), "expected auth error: {detail}");
+}
