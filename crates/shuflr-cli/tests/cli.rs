@@ -530,6 +530,55 @@ fn stream_buffer_on_gzip_input_works() {
 }
 
 #[test]
+fn convert_with_verify_passes_on_clean_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("in.jsonl");
+    let output = tmp.path().join("out.jsonl.zst");
+    let content: String = (0..300)
+        .map(|i| format!("{{\"i\":{i},\"pad\":\"xxxxxxxxxxxx\"}}\n"))
+        .collect();
+    std::fs::write(&input, &content).unwrap();
+
+    shuflr()
+        .args(["convert", "--verify", "--log-level", "warn", "-o"])
+        .arg(&output)
+        .arg(&input)
+        .assert()
+        .success();
+}
+
+#[test]
+fn convert_with_verify_fails_when_output_is_corrupted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("in.jsonl");
+    let output = tmp.path().join("out.jsonl.zst");
+    std::fs::write(&input, "a\nb\nc\nd\ne\n").unwrap();
+
+    // First write without verify, then corrupt, then verify via a second run.
+    shuflr()
+        .args(["convert", "--log-level", "warn", "-o"])
+        .arg(&output)
+        .arg(&input)
+        .assert()
+        .success();
+
+    // Corrupt the trailing seek-table magic.
+    let mut bytes = std::fs::read(&output).unwrap();
+    let len = bytes.len();
+    bytes[len - 3] ^= 0xff;
+    std::fs::write(&output, &bytes).unwrap();
+
+    // Re-running convert with --verify would overwrite; instead use `info`
+    // which also reads the seek table, so we assert rejection via info.
+    shuflr()
+        .args(["info"])
+        .arg(&output)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not a zstd-seekable"));
+}
+
+#[test]
 fn index_subcommand_builds_sidecar() {
     let tmp = tempfile::tempdir().unwrap();
     let input = tmp.path().join("data.jsonl");

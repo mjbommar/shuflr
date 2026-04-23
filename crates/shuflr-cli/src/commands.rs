@@ -581,7 +581,23 @@ fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
     );
 
     if args.verify {
-        tracing::warn!("--verify is a PR-5 feature; skipping post-write verification");
+        // Only verify file outputs; stdout would need a buffered round-trip which
+        // is out of scope here. Most real use cases write to a file anyway.
+        if args.output == std::path::Path::new("-") {
+            tracing::warn!("--verify skipped: output is stdout; re-run with -o FILE to verify");
+        } else {
+            let vstart = Instant::now();
+            let report =
+                shuflr::io::zstd_seekable::verify_strict(std::path::Path::new(&args.output))?;
+            tracing::info!(
+                output = %args.output.display(),
+                frames = report.frames,
+                records = report.records,
+                decompressed_bytes = report.total_decompressed,
+                elapsed_ms = vstart.elapsed().as_millis() as u64,
+                "verify OK",
+            );
+        }
     }
 
     Ok(())

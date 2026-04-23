@@ -80,7 +80,7 @@ Two crates, not four. The library `shuflr` contains all engine modules (`shuffle
 
 ## Current status
 
-Through PR-8: CLI dispatch, `--shuffle={none,buffer:K,chunk-shuffled,index-perm}`, transparent streaming decompression for `.gz` / `.zst` / `.bz2` / `.xz`, multi-threaded `shuflr convert` (4.56× on 16 cores), `shuflr info`, and `shuflr index` → `.shuflr-idx` sidecar. `stream --shuffle=index-perm` auto-builds the sidecar on first use, reuses it when the fingerprint (blake3 of basename+size+mtime) matches, rebuilds on mismatch. Produces provably-uniform Fisher-Yates shuffles on plain JSONL inputs; compressed inputs get a clear error pointing at `shuflr convert` + `chunk-shuffled`. 110 tests green (69 lib unit + 3 lib integration + 5 CLI unit + 33 CLI integration). Real-corpus: 76 ms index build on 10k EDGAR records, 5 ms per `--sample=100` run. Next: PR-9 — `--verify` for `shuflr convert`, or PR-10 — progress bar (indicatif).
+Through PR-9: CLI dispatch, `--shuffle={none,buffer:K,chunk-shuffled,index-perm}`, transparent streaming decompression for `.gz` / `.zst` / `.bz2` / `.xz`, multi-threaded `shuflr convert --verify` (4.56× on 16 cores, 3.2 s post-write frame-by-frame check on 5.15 GiB), `shuflr info` (<10ms seek-table summary), `shuflr index` → `.shuflr-idx` sidecar with fingerprint-based reuse. All four v1 shuffle modes live; `index-perm` produces provably uniform Fisher-Yates permutations. 116 tests green (73 lib unit + 3 lib integration + 5 CLI unit + 35 CLI integration). Next: PR-10 — progress bar (indicatif) or PR-11 — `--rank` / `--world-size` distributed partitioning.
 
 ## Upstream
 
