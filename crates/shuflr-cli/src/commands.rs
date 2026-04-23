@@ -48,6 +48,7 @@ fn stream_inner(args: cli::StreamArgs) -> shuflr::Result<()> {
             on_error: args.on_error.into(),
             sample: remaining_sample(args.sample, &total),
             ensure_trailing_newline: true,
+            partition: partition_from_args(&args),
         };
 
         let started = Instant::now();
@@ -94,6 +95,15 @@ fn stream_inner(args: cli::StreamArgs) -> shuflr::Result<()> {
 
 fn remaining_sample(sample: Option<u64>, so_far: &shuflr::Stats) -> Option<u64> {
     sample.map(|cap| cap.saturating_sub(so_far.records_out))
+}
+
+/// Extract the `(rank, world_size)` tuple from CLI args, if both are set.
+fn partition_from_args(args: &cli::StreamArgs) -> Option<(u32, u32)> {
+    match (args.rank, args.world_size) {
+        (Some(r), Some(w)) if w > 1 && r < w => Some((r, w)),
+        (Some(_), Some(1)) => None, // world_size=1 is effectively no partition
+        _ => None,
+    }
 }
 
 fn accumulate(total: &mut shuflr::Stats, step: &shuflr::Stats) {
@@ -254,6 +264,7 @@ fn stream_index_perm_inner(args: cli::StreamArgs) -> shuflr::Result<()> {
             epoch,
             sample: remaining_sample(args.sample, &total),
             ensure_trailing_newline: true,
+            partition: partition_from_args(&args),
         };
         let started = Instant::now();
         let stats = shuflr::pipeline::index_perm(path, &index, &mut sink, &cfg)?;
@@ -355,6 +366,7 @@ fn stream_chunk_shuffled_inner(args: cli::StreamArgs) -> shuflr::Result<()> {
             on_error: args.on_error.into(),
             sample: remaining_sample(args.sample, &total),
             ensure_trailing_newline: true,
+            partition: partition_from_args(&args),
         };
         let started = Instant::now();
         let stats = shuflr::pipeline::chunk_shuffled(reader, &mut sink, &cfg)?;
@@ -436,6 +448,7 @@ fn stream_buffer_inner(args: cli::StreamArgs) -> shuflr::Result<()> {
             on_error: args.on_error.into(),
             sample: remaining_sample(args.sample, &total),
             ensure_trailing_newline: true,
+            partition: partition_from_args(&args),
         };
 
         let started = Instant::now();

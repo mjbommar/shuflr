@@ -39,6 +39,10 @@ pub struct Config {
     /// Patch a trailing `\n` on any record that lacks one (shouldn't
     /// happen for a well-formed input, but we tolerate it).
     pub ensure_trailing_newline: bool,
+    /// Distributed partition: rank R of W takes every W-th index of the
+    /// shuffled permutation starting at offset R. Disjoint across ranks;
+    /// every record is claimed by exactly one rank.
+    pub partition: Option<(u32, u32)>,
 }
 
 impl Default for Config {
@@ -48,6 +52,7 @@ impl Default for Config {
             epoch: 0,
             sample: None,
             ensure_trailing_newline: true,
+            partition: None,
         }
     }
 }
@@ -81,6 +86,23 @@ pub fn run(input_path: &Path, index: &IndexFile, sink: impl Write, cfg: &Config)
     let mut rng = Seed::rng_from(seed.perm(cfg.epoch));
     perm.shuffle(&mut rng);
 
+    // Distributed partition: take every W-th index starting at R.
+    let (rank, world_size) = cfg.partition.unwrap_or((0, 1));
+    let my_perm: Vec<u32> = if world_size <= 1 {
+        perm
+    } else {
+        perm.into_iter()
+            .enumerate()
+            .filter_map(|(pos, i)| {
+                if (pos as u32) % world_size == rank {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+
     // Reused record buffer sized to the largest record in the index; small
     // fixtures keep this cheap, large corpora cap here at max record length.
     let mut max_len = 0u64;
@@ -89,7 +111,7 @@ pub fn run(input_path: &Path, index: &IndexFile, sink: impl Write, cfg: &Config)
     }
     let mut buf: Vec<u8> = vec![0u8; max_len as usize];
 
-    for &i in &perm {
+    for &i in &my_perm {
         let idx = i as usize;
         let (start, end) = index.record_range(idx);
         let len = (end - start) as usize;
@@ -146,10 +168,26 @@ pub fn run(input_path: &Path, index: &IndexFile, sink: impl Write, cfg: &Config)
     let mut rng = Seed::rng_from(seed.perm(cfg.epoch));
     perm.shuffle(&mut rng);
 
+    let (rank, world_size) = cfg.partition.unwrap_or((0, 1));
+    let my_perm: Vec<u32> = if world_size <= 1 {
+        perm
+    } else {
+        perm.into_iter()
+            .enumerate()
+            .filter_map(|(pos, i)| {
+                if (pos as u32) % world_size == rank {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+
     let max_len: u64 = (0..count).map(|i| index.record_len(i)).max().unwrap_or(0);
     let mut buf: Vec<u8> = vec![0u8; max_len as usize];
 
-    for &i in &perm {
+    for &i in &my_perm {
         let idx = i as usize;
         let (start, end) = index.record_range(idx);
         let len = (end - start) as usize;

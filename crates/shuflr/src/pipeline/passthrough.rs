@@ -27,6 +27,10 @@ pub struct Config {
     pub sample: Option<u64>,
     /// If true, ensure the last emitted record ends with `\n` even if the input didn't.
     pub ensure_trailing_newline: bool,
+    /// Distributed partition: `(rank, world_size)`. When `world_size > 1`, this
+    /// rank emits only records at input positions `idx % world_size == rank`.
+    /// Disjoint across ranks, deterministic, no inter-rank coordination needed.
+    pub partition: Option<(u32, u32)>,
 }
 
 impl Default for Config {
@@ -36,6 +40,7 @@ impl Default for Config {
             on_error: OnError::Skip,
             sample: None,
             ensure_trailing_newline: true,
+            partition: None,
         }
     }
 }
@@ -59,6 +64,8 @@ pub fn run(mut input: Input, sink: impl Write, cfg: &Config) -> Result<Stats> {
     // Reused across iterations; capacity grows as needed and stays.
     let mut line: Vec<u8> = Vec::with_capacity(8 * 1024);
     let mut byte_offset: u64 = 0;
+
+    let (rank, world_size) = cfg.partition.unwrap_or((0, 1));
 
     loop {
         line.clear();
@@ -85,6 +92,13 @@ pub fn run(mut input: Input, sink: impl Write, cfg: &Config) -> Result<Stats> {
             if !keep {
                 continue;
             }
+        }
+
+        // Distributed partition: skip records not assigned to this rank.
+        // Every record counts toward `records_in`; only "our" records count
+        // toward `records_out` and get emitted.
+        if world_size > 1 && ((stats.records_in - 1) as u32) % world_size != rank {
+            continue;
         }
 
         // Emit.

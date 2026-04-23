@@ -35,6 +35,9 @@ pub struct Config {
     pub on_error: OnError,
     pub sample: Option<u64>,
     pub ensure_trailing_newline: bool,
+    /// Distributed partition: rank R of W takes every W-th frame of the shuffled
+    /// frame order starting at offset R. Disjoint across ranks.
+    pub partition: Option<(u32, u32)>,
 }
 
 impl Default for Config {
@@ -46,6 +49,7 @@ impl Default for Config {
             on_error: OnError::Skip,
             sample: None,
             ensure_trailing_newline: true,
+            partition: None,
         }
     }
 }
@@ -63,7 +67,26 @@ pub fn run(mut reader: SeekableReader, sink: impl Write, cfg: &Config) -> Result
         frame_order.shuffle(&mut perm_rng);
     }
 
-    for frame_id in frame_order {
+    // Distributed partition: take every W-th frame starting at R. Disjoint
+    // across ranks; every frame is claimed by exactly one rank.
+    let (rank, world_size) = cfg.partition.unwrap_or((0, 1));
+    let my_frames: Vec<usize> = if world_size <= 1 {
+        frame_order
+    } else {
+        frame_order
+            .into_iter()
+            .enumerate()
+            .filter_map(|(pos, fid)| {
+                if (pos as u32) % world_size == rank {
+                    Some(fid)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+
+    for frame_id in my_frames {
         let frame = reader.decompress_frame(frame_id)?;
         stats.bytes_in += frame.len() as u64;
 

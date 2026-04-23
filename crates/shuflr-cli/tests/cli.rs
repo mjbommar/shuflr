@@ -129,6 +129,47 @@ fn rank_requires_world_size() {
         .stderr(predicate::str::contains("world-size"));
 }
 
+#[test]
+fn rank_world_size_produces_disjoint_partitions() {
+    use std::collections::HashSet;
+
+    // Run W separate shuflr invocations, each at a different rank, concat
+    // their outputs, and assert it's a permutation of the input.
+    let input: String = (0..400).map(|i| format!("rec_{i:03}\n")).collect();
+    let w = 4u32;
+    let mut union: HashSet<String> = HashSet::new();
+    let mut total_out = 0usize;
+    for rank in 0..w {
+        let assert = shuflr()
+            .args([
+                "stream",
+                "--shuffle",
+                "none",
+                "--rank",
+                &rank.to_string(),
+                "--world-size",
+                &w.to_string(),
+                "--log-level",
+                "warn",
+            ])
+            .write_stdin(input.clone())
+            .assert()
+            .success();
+        let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+        for line in out.lines() {
+            assert!(
+                union.insert(line.to_string()),
+                "record {line} appeared in two ranks"
+            );
+            total_out += 1;
+        }
+    }
+    assert_eq!(total_out, 400, "all records accounted for across ranks");
+    let in_set: HashSet<&str> = input.lines().collect();
+    let out_set: HashSet<&str> = union.iter().map(|s| s.as_str()).collect();
+    assert_eq!(in_set, out_set);
+}
+
 fn tiny_corpus() -> std::path::PathBuf {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace = manifest.ancestors().nth(2).unwrap();

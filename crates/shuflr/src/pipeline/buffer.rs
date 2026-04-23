@@ -41,6 +41,8 @@ pub struct Config {
     pub sample: Option<u64>,
     /// Patch a trailing `\n` on a final record that lacks one.
     pub ensure_trailing_newline: bool,
+    /// Distributed partition: see `passthrough::Config::partition`.
+    pub partition: Option<(u32, u32)>,
 }
 
 impl Default for Config {
@@ -52,6 +54,7 @@ impl Default for Config {
             on_error: OnError::Skip,
             sample: None,
             ensure_trailing_newline: true,
+            partition: None,
         }
     }
 }
@@ -94,6 +97,14 @@ pub fn run(mut input: Input, sink: impl Write, cfg: &Config) -> Result<Stats> {
             if !keep {
                 continue;
             }
+        }
+
+        // Distributed partition: only "our" records enter the ring.
+        if let Some((rank, world_size)) = cfg.partition
+            && world_size > 1
+            && ((stats.records_in - 1) as u32) % world_size != rank
+        {
+            continue;
         }
 
         // Patch a trailing '\n' on the final partial line so every ring entry

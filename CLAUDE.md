@@ -80,7 +80,7 @@ Two crates, not four. The library `shuflr` contains all engine modules (`shuffle
 
 ## Current status
 
-Through PR-9: CLI dispatch, `--shuffle={none,buffer:K,chunk-shuffled,index-perm}`, transparent streaming decompression for `.gz` / `.zst` / `.bz2` / `.xz`, multi-threaded `shuflr convert --verify` (4.56× on 16 cores, 3.2 s post-write frame-by-frame check on 5.15 GiB), `shuflr info` (<10ms seek-table summary), `shuflr index` → `.shuflr-idx` sidecar with fingerprint-based reuse. All four v1 shuffle modes live; `index-perm` produces provably uniform Fisher-Yates permutations. 116 tests green (73 lib unit + 3 lib integration + 5 CLI unit + 35 CLI integration). Next: PR-10 — progress bar (indicatif) or PR-11 — `--rank` / `--world-size` distributed partitioning.
+Through PR-10: CLI dispatch, `--shuffle={none,buffer:K,chunk-shuffled,index-perm}`, transparent streaming decompression for `.gz` / `.zst` / `.bz2` / `.xz`, multi-threaded `shuflr convert --verify` (4.56× on 16 cores), `shuflr info`, `shuflr index` with fingerprint-based sidecar reuse. **`--rank R --world-size W` produces disjoint, complete partitions across ranks on all four shuffle modes.** Verified on real EDGAR corpus: 4 ranks via `chunk-shuffled` give 24695 + 24991 + 24913 + 25400 records that sum exactly to 99999 — the non-partitioned total. 121 tests green (73 lib unit + 3 lib integration + 4 rank-disjoint property tests + 5 CLI unit + 36 CLI integration). Next: PR-11 — progress bar (indicatif), or fill in remaining shuffle modes (`reservoir`, `chunk-rr`).
 
 ## Upstream
 
