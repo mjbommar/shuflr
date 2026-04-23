@@ -2,16 +2,41 @@
 //!
 //! Each record in the file is identified by `(frame_id, offset_in_frame,
 //! length)` — enough to locate it in one pread + one frame-decode. Built
-//! by decoding every frame once and scanning for record boundaries. The
-//! index is in-memory only in this PR (v1 no sidecar persistence); a
-//! future PR can add a `.shuflr-idx-zst` variant alongside the existing
-//! plain-file `.shuflr-idx`.
+//! by decoding every frame once and scanning for record boundaries.
+//! Persisted to a `.shuflr-idx-zst` sidecar so repeat `index-perm` runs
+//! skip the full-file scan (which is the dominant cost on a large
+//! corpus: ~126 s on the 30 GB EDGAR seekable per bench/001).
 //!
-//! Memory budget: 12 bytes per record. A 1.2M-record EDGAR corpus
-//! indexes to ~14 MB.
+//! Wire format:
+//!
+//! ```text
+//!   Magic         [u8; 8]  = b"SHUFLRZI"
+//!   Version       u8       = 1
+//!   Reserved      [u8; 7]  = 0
+//!   Fingerprint   [u8; 32] = blake3(basename ‖ size ‖ mtime_secs)
+//!   Count         u64
+//!   Entries       [(u32 frame_id, u32 offset_in_frame, u32 length); Count]
+//! ```
+//!
+//! Size: 56 + 12·N bytes. A 1.2M-record EDGAR corpus → ~14 MiB sidecar.
+
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 use super::reader::SeekableReader;
 use crate::error::{Error, Result};
+use crate::index::Fingerprint;
+
+pub const MAGIC: &[u8; 8] = b"SHUFLRZI";
+pub const CURRENT_VERSION: u8 = 1;
+
+/// Canonical sidecar path: `<input>.shuflr-idx-zst`.
+pub fn sidecar_path(input: &Path) -> PathBuf {
+    let mut s = input.as_os_str().to_os_string();
+    s.push(".shuflr-idx-zst");
+    PathBuf::from(s)
+}
 
 /// Location of one record inside a seekable-zstd file.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -22,10 +47,13 @@ pub struct RecordLocation {
     pub length: u32,
 }
 
-/// In-memory record index.
+/// In-memory record index. `fingerprint` is populated when the index
+/// was loaded from (or saved to) a sidecar; `None` for an index that
+/// was just built and hasn't been persisted.
 #[derive(Debug, Default)]
 pub struct RecordIndex {
     pub entries: Vec<RecordLocation>,
+    pub fingerprint: Option<Fingerprint>,
 }
 
 impl RecordIndex {
@@ -86,7 +114,95 @@ impl RecordIndex {
                 });
             }
         }
-        Ok((Self { entries }, total_bytes))
+        Ok((
+            Self {
+                entries,
+                fingerprint: None,
+            },
+            total_bytes,
+        ))
+    }
+
+    /// Serialize to `out` in the wire format above.
+    pub fn write_to(&self, mut out: impl Write, fingerprint: Fingerprint) -> Result<()> {
+        out.write_all(MAGIC).map_err(Error::Io)?;
+        out.write_all(&[CURRENT_VERSION]).map_err(Error::Io)?;
+        out.write_all(&[0u8; 7]).map_err(Error::Io)?;
+        out.write_all(&fingerprint.0).map_err(Error::Io)?;
+        out.write_all(&(self.entries.len() as u64).to_le_bytes())
+            .map_err(Error::Io)?;
+        for e in &self.entries {
+            out.write_all(&e.frame_id.to_le_bytes())
+                .map_err(Error::Io)?;
+            out.write_all(&e.offset_in_frame.to_le_bytes())
+                .map_err(Error::Io)?;
+            out.write_all(&e.length.to_le_bytes()).map_err(Error::Io)?;
+        }
+        Ok(())
+    }
+
+    /// Atomic save: write to `path.tmp`, fsync, rename onto `path`.
+    pub fn save(&self, path: &Path, fingerprint: Fingerprint) -> Result<()> {
+        let tmp = {
+            let mut s = path.as_os_str().to_os_string();
+            s.push(".tmp");
+            PathBuf::from(s)
+        };
+        {
+            let mut f = fs::File::create(&tmp).map_err(Error::Io)?;
+            self.write_to(&mut f, fingerprint)?;
+            f.sync_all().map_err(Error::Io)?;
+        }
+        fs::rename(&tmp, path).map_err(Error::Io)?;
+        Ok(())
+    }
+
+    /// Deserialize from reader.
+    pub fn read_from(mut r: impl Read) -> Result<Self> {
+        let mut magic = [0u8; 8];
+        r.read_exact(&mut magic).map_err(Error::Io)?;
+        if &magic != MAGIC {
+            return Err(Error::Input(format!(
+                "not a shuflr seekable-zstd index (magic {magic:?} != {MAGIC:?})"
+            )));
+        }
+        let mut version = [0u8; 1];
+        r.read_exact(&mut version).map_err(Error::Io)?;
+        if version[0] != CURRENT_VERSION {
+            return Err(Error::Input(format!(
+                "unsupported seekable-zstd index version {} (expected {CURRENT_VERSION})",
+                version[0]
+            )));
+        }
+        let mut reserved = [0u8; 7];
+        r.read_exact(&mut reserved).map_err(Error::Io)?;
+        let mut fp = [0u8; 32];
+        r.read_exact(&mut fp).map_err(Error::Io)?;
+        let mut count_buf = [0u8; 8];
+        r.read_exact(&mut count_buf).map_err(Error::Io)?;
+        let count = u64::from_le_bytes(count_buf) as usize;
+        let mut entries = Vec::with_capacity(count);
+        let mut buf = [0u8; 12];
+        for _ in 0..count {
+            r.read_exact(&mut buf).map_err(Error::Io)?;
+            let frame_id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            let offset_in_frame = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            let length = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+            entries.push(RecordLocation {
+                frame_id,
+                offset_in_frame,
+                length,
+            });
+        }
+        Ok(Self {
+            entries,
+            fingerprint: Some(Fingerprint(fp)),
+        })
+    }
+
+    pub fn load(path: &Path) -> Result<Self> {
+        let f = fs::File::open(path).map_err(Error::Io)?;
+        Self::read_from(std::io::BufReader::with_capacity(2 * 1024 * 1024, f))
     }
 }
 
@@ -259,6 +375,40 @@ mod tests {
         let before = cache.misses;
         let _ = cache.get(&mut reader, 0).unwrap();
         assert_eq!(cache.misses, before + 1, "frame 0 should have been evicted");
+    }
+
+    #[test]
+    fn sidecar_roundtrip_preserves_entries() {
+        let records: Vec<String> = (0..75).map(|i| format!("r{i:02}\n")).collect();
+        let record_refs: Vec<&[u8]> = records.iter().map(|s| s.as_bytes()).collect();
+        let tf = build_fixture(&record_refs);
+
+        let mut reader = SeekableReader::open(tf.path()).unwrap();
+        let (idx, _) = RecordIndex::build(&mut reader).unwrap();
+
+        let sidecar = tempfile::NamedTempFile::new().unwrap();
+        let fp = Fingerprint([0xcd; 32]);
+        idx.save(sidecar.path(), fp).unwrap();
+
+        let loaded = RecordIndex::load(sidecar.path()).unwrap();
+        assert_eq!(loaded.entries, idx.entries);
+        assert_eq!(loaded.fingerprint, Some(fp));
+    }
+
+    #[test]
+    fn sidecar_rejects_wrong_magic() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"WRONG_MAGIC_data").unwrap();
+        assert!(RecordIndex::load(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn sidecar_path_uses_expected_suffix() {
+        let p = Path::new("/tmp/x.jsonl.zst");
+        assert_eq!(
+            sidecar_path(p),
+            PathBuf::from("/tmp/x.jsonl.zst.shuflr-idx-zst")
+        );
     }
 
     #[test]

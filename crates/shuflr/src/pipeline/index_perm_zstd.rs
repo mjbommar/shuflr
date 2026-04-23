@@ -67,11 +67,56 @@ pub struct RunMetrics {
 }
 
 /// Run index-perm over a seekable-zstd input.
+///
+/// If a `<path>.shuflr-idx-zst` sidecar exists and its fingerprint matches
+/// the current input's metadata, the sidecar is loaded instead of
+/// re-scanning the file. Otherwise the index is built from scratch and
+/// persisted atomically so the next run is cheap.
 pub fn run(path: &Path, sink: impl Write, cfg: &Config) -> Result<(Stats, RunMetrics)> {
+    use crate::Fingerprint;
+    use crate::io::zstd_seekable::record_index;
+
     let mut reader = SeekableReader::open(path)?;
     let mut metrics = RunMetrics::default();
+
+    // Fingerprint-gated sidecar load.
+    let fingerprint = Fingerprint::from_metadata(path)?;
+    let sidecar = record_index::sidecar_path(path);
     let t_build_start = std::time::Instant::now();
-    let (index, scanned) = RecordIndex::build(&mut reader)?;
+    let (index, scanned) = match RecordIndex::load(&sidecar) {
+        Ok(loaded) if loaded.fingerprint == Some(fingerprint) => {
+            tracing::info!(
+                sidecar = %sidecar.display(),
+                records = loaded.entries.len(),
+                "loaded seekable-zstd record-index from sidecar",
+            );
+            (loaded, 0u64)
+        }
+        Ok(_) => {
+            tracing::warn!(
+                sidecar = %sidecar.display(),
+                "sidecar fingerprint mismatches input; rebuilding",
+            );
+            let (built, scanned) = RecordIndex::build(&mut reader)?;
+            if let Err(e) = built.save(&sidecar, fingerprint) {
+                tracing::warn!(err = %e, "failed to persist rebuilt sidecar; continuing");
+            }
+            (built, scanned)
+        }
+        Err(_) => {
+            let (built, scanned) = RecordIndex::build(&mut reader)?;
+            if let Err(e) = built.save(&sidecar, fingerprint) {
+                tracing::warn!(err = %e, "failed to persist new sidecar; continuing");
+            } else {
+                tracing::info!(
+                    sidecar = %sidecar.display(),
+                    records = built.entries.len(),
+                    "built + saved seekable-zstd record-index sidecar",
+                );
+            }
+            (built, scanned)
+        }
+    };
     metrics.index_build_ms = t_build_start.elapsed().as_millis() as u64;
     metrics.records_scanned = index.len() as u64;
     metrics.total_decompressed_in_build = scanned;

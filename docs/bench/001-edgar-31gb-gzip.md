@@ -132,11 +132,43 @@ Key findings:
 
 To push past 2.37 GB/s we'd need: parallel file reads (io_uring or multi-thread pread), wait-free frame-boundary detection, or both. None are in scope for v1.
 
+### Operation #13 — index-perm on seekable-zstd: sidecar persistence (PR-23)
+
+The `index-perm` shuffle mode on a seekable-zstd input first builds an in-memory record index: one `(frame_id u32, offset u32, length u32)` tuple per record, 12 B each. Before PR-23 this was rebuilt every run — for the 1.2M-record EDGAR corpus that means a full 28,695-frame decode on every invocation, ~127 s of CPU.
+
+PR-23 persists that index to a `<input>.shuflr-idx-zst` sidecar, gated by a BLAKE3 fingerprint of the input's `(len, mtime, size, first-4KiB, last-4KiB)`. The load path reads the sidecar, verifies the fingerprint against the current input, and skips the rebuild if fresh.
+
+Wire format (see `crates/shuflr/src/io/zstd_seekable/record_index.rs`):
+
+```
+magic     b"SHUFLRZI"  (8)
+version   u8 = 1       (1)
+reserved  [u8; 7]      (7, zero)
+fingerprint [u8; 32]   (32, BLAKE3)
+count     u64 LE       (8)
+entries   12 · N bytes
+```
+
+56 + 12·N. For the 1.2M-record EDGAR corpus: **14.40 MiB sidecar**.
+
+Measured on `tmp/edgar-0.05.jsonl.zst` (30.92 GB seekable-zstd, 1,199,612 records):
+
+| Phase | Wall | Max RSS | Index phase | Notes |
+|---|---|---|---|---|
+| Cold (no sidecar) | **127.58 s** | 536 MiB | 127,530 ms (build + save) | Full 28,695-frame scan |
+| Hot (sidecar fresh) | **0.08 s** | 55 MiB | 12 ms (load) | **1,595× speedup** |
+| Stale (fingerprint mismatch) | 126.87 s | 550 MiB | 126,815 ms (rebuild + overwrite) | `touch`'d input; WARN-logs, rebuilds cleanly |
+
+Output byte-identical across all three runs for the same `--seed`.
+
+The sidecar is **not** a security-sensitive cache: a fingerprint collision would at worst yield stale record positions that decompress-fail at runtime (not silent data corruption). We accept that risk in exchange for O(1) startup on repeat runs. Users who want to force a rebuild can delete the sidecar.
+
 ## Open follow-ups (updated)
 
 - **Surface `oversized_skipped` counters more loudly** — e.g. as a WARN log at end-of-run when non-zero, so users don't silently miss 100 GB of data under default settings.
 - Add a parallel frame-decode path to `chunk-shuffled` to push past the current 1.2 GB/s ceiling on large files.
 - Add **Jensen-Shannon divergence** + per-frame **entropy** to `analyze` — both cheap additions to the existing 256-bin histogram pipeline; JS is symmetric and bounded [0, ln 2] so thresholds transfer across corpora.
-- Extend `index-perm` to seekable-zstd inputs (today it only works on plain .jsonl) so we can recommend it without asking users to decompress first.
+- ~~Extend `index-perm` to seekable-zstd inputs (today it only works on plain .jsonl) so we can recommend it without asking users to decompress first.~~ **Done in PR-22; sidecar added in PR-23 (see §13).**
 - **Default `--threads=0` may be suboptimal on hyperthreaded CPUs.** Consider defaulting to `num_physical_cpus()` instead of `available_parallelism()` when the host reports more logical than physical cores.
 - Parallel reader path: split a seekable input file into regions, `pread` in parallel, reassemble. Would push the local-plain ceiling higher than 2.37 GB/s.
+- **Parallel frame-decode for `index-perm` on seekable-zstd.** Today each emitted record costs one frame decode (~3–4 ms). A small thread pool doing N decodes concurrently would hide most of that latency for bulk uniform shuffles. Not yet implemented — `--sample=N` with small N is already fast, and users who need full-uniform-shuffle throughput can still decompress to `.jsonl` first and use the plain-file path.

@@ -1154,18 +1154,33 @@ fn index_inner(args: cli::IndexArgs) -> shuflr::Result<()> {
             "`shuflr index` requires a seekable file (stdin has no persistent offsets)".into(),
         ));
     }
-    // Reject compressed inputs; index-perm needs byte-offset random access.
+
     let probe = shuflr::io::Input::open(in_path)?;
-    if probe.raw_format() != shuflr::io::magic::Format::Plain {
+    let raw_format = probe.raw_format();
+    drop(probe);
+
+    // Seekable zstd: build a RecordIndex and persist to the
+    // .shuflr-idx-zst sidecar. Plain JSONL: the existing byte-offset
+    // IndexFile → .shuflr-idx sidecar. Streaming-only compressed
+    // inputs (non-seekable zstd, gz, bz2, xz) reject with guidance.
+    #[cfg(feature = "zstd")]
+    {
+        if raw_format == shuflr::io::magic::Format::Zstd
+            && shuflr::io::zstd_seekable::SeekableReader::open(in_path).is_ok()
+        {
+            return index_inner_zstd(args.output.as_deref(), in_path);
+        }
+    }
+
+    if raw_format != shuflr::io::magic::Format::Plain {
         return Err(shuflr::Error::Input(format!(
-            "`shuflr index` currently only supports plain JSONL. \
-             '{}' is {}; decompress to '.jsonl' first, or convert to zstd-seekable \
-             and use --shuffle=chunk-shuffled instead.",
+            "`shuflr index` supports plain JSONL and seekable zstd only. \
+             '{}' is {}; decompress to '.jsonl', or run `shuflr convert` \
+             to produce a seekable .zst first.",
             in_path.display(),
-            probe.raw_format().name(),
+            raw_format.name(),
         )));
     }
-    drop(probe);
 
     let out_path = args
         .output
@@ -1187,7 +1202,38 @@ fn index_inner(args: cli::IndexArgs) -> shuflr::Result<()> {
         records = idx.count(),
         build_ms,
         save_ms,
-        "index built",
+        "index built (plain)",
+    );
+    Ok(())
+}
+
+#[cfg(feature = "zstd")]
+fn index_inner_zstd(
+    explicit_out: Option<&std::path::Path>,
+    in_path: &std::path::Path,
+) -> shuflr::Result<()> {
+    let out_path = explicit_out
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| shuflr::io::zstd_seekable::record_index::sidecar_path(in_path));
+
+    let started = Instant::now();
+    let fingerprint = shuflr::Fingerprint::from_metadata(in_path)?;
+    let mut reader = shuflr::io::zstd_seekable::SeekableReader::open(in_path)?;
+    let (idx, scanned) = shuflr::io::zstd_seekable::RecordIndex::build(&mut reader)?;
+    let build_ms = started.elapsed().as_millis() as u64;
+
+    let save_start = Instant::now();
+    idx.save(&out_path, fingerprint)?;
+    let save_ms = save_start.elapsed().as_millis() as u64;
+
+    tracing::info!(
+        input = %in_path.display(),
+        index = %out_path.display(),
+        records = idx.len(),
+        decompressed_bytes = scanned,
+        build_ms,
+        save_ms,
+        "index built (seekable-zstd)",
     );
     Ok(())
 }
