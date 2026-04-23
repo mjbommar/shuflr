@@ -993,6 +993,24 @@ fn print_report(
     .map_err(shuflr::Error::Io)?;
     writeln!(
         out,
+        "byte-JS max:   {:.4} nats (of {:.3} max; {})",
+        report.byte_js_max,
+        std::f64::consts::LN_2,
+        qualify(
+            report.byte_js_max,
+            shuflr::analyze::BYTE_JS_THRESHOLD_UNSAFE
+        )
+    )
+    .map_err(shuflr::Error::Io)?;
+    writeln!(
+        out,
+        "entropy mean:  {:.3} nats / {:.3} bits (of 8.00 max)",
+        report.frame_entropy_mean,
+        report.frame_entropy_mean / std::f64::consts::LN_2,
+    )
+    .map_err(shuflr::Error::Io)?;
+    writeln!(
+        out,
         "reclen CV:     {:.3}      ({})",
         report.reclen_cv,
         qualify(
