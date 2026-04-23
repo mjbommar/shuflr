@@ -572,6 +572,7 @@ pub fn convert(args: cli::ConvertArgs) -> exit::Code {
 
 #[cfg(feature = "zstd")]
 fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
+    use crate::progress;
     use shuflr::io::zstd_seekable::{ParallelConfig, Writer, WriterConfig, convert_parallel};
     use std::io::{BufReader, Read};
     use std::time::Instant;
@@ -593,6 +594,7 @@ fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
 
     let input = shuflr::io::Input::open(in_path)?;
     let effective_threads = resolve_threads(args.threads as usize);
+    let input_size = input.size_hint();
     tracing::info!(
         path = %in_path.display(),
         raw_format = ?input.raw_format(),
@@ -611,6 +613,20 @@ fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
         Box::new(file)
     };
 
+    // Build the progress bar if --progress allows it. For compressed inputs the
+    // decompressed size is unknown; we fall back to a spinner by passing `None`.
+    let show_progress = progress::should_show(args.progress);
+    let bar = if show_progress {
+        let total = if input.raw_format() == shuflr::io::magic::Format::Plain {
+            input_size
+        } else {
+            None
+        };
+        Some(progress::new_bar(total, "convert"))
+    } else {
+        None
+    };
+
     let started = Instant::now();
     let stats = if effective_threads <= 1 {
         // Single-threaded path: simple Writer API.
@@ -621,7 +637,12 @@ fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
             record_aligned: !args.no_record_align,
         };
         let mut writer = Writer::new(output, cfg);
-        let mut reader = BufReader::with_capacity(2 * 1024 * 1024, input);
+        // Wrap input in the progress reader if a bar is active.
+        let reader_source: Box<dyn Read> = match &bar {
+            Some(pb) => Box::new(progress::ProgressReader::new(input, pb.clone())),
+            None => Box::new(input),
+        };
+        let mut reader = BufReader::with_capacity(2 * 1024 * 1024, reader_source);
         let mut buf = vec![0u8; 2 * 1024 * 1024];
         loop {
             let n = reader.read(&mut buf).map_err(shuflr::Error::Io)?;
@@ -640,9 +661,21 @@ fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
             record_aligned: !args.no_record_align,
             threads: effective_threads,
         };
-        convert_parallel(input, output, &cfg)?
+        // Wrap input in the progress reader if a bar is active. The reader
+        // thread in convert_parallel is the throttle point; its read calls
+        // bump the bar as input bytes move through.
+        match &bar {
+            Some(pb) => {
+                let wrapped = progress::ProgressReader::new(input, pb.clone());
+                convert_parallel(wrapped, output, &cfg)?
+            }
+            None => convert_parallel(input, output, &cfg)?,
+        }
     };
     let elapsed = started.elapsed();
+    if let Some(pb) = &bar {
+        pb.finish_and_clear();
+    }
 
     let ratio = if stats.uncompressed_bytes > 0 {
         stats.compressed_bytes as f64 / stats.uncompressed_bytes as f64

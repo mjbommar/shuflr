@@ -9,6 +9,7 @@
 mod cli;
 mod commands;
 mod exit;
+mod progress;
 
 use std::io::Write as _;
 use std::process::ExitCode;

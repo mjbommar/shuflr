@@ -80,7 +80,7 @@ Two crates, not four. The library `shuflr` contains all engine modules (`shuffle
 
 ## Current status
 
-Through PR-11: CLI dispatch, `--shuffle={none,buffer:K,chunk-shuffled,index-perm,reservoir}`, transparent streaming decompression for `.gz` / `.zst` / `.bz2` / `.xz`, multi-threaded `shuflr convert --verify` (4.56× on 16 cores), `shuflr info`, `shuflr index` with fingerprint-based sidecar reuse, `--rank R --world-size W` disjoint partitioning on all shuffle modes. Five of six v1 shuffle modes live (only `chunk-rr` deferred — strictly dominated by `chunk-shuffled`). Reservoir uses Vitter Algorithm R, emits exactly K uniform-random records, runs at 1.35 GB/s on real zstd-decoded EDGAR (100k records × 5.5 GiB → 100-record sample in 3.9 s). 126 tests green. Next: PR-12 — progress bar (indicatif) for long-running convert/index runs, or `shuflr analyze`.
+Through PR-12: CLI dispatch, `--shuffle={none,buffer:K,chunk-shuffled,index-perm,reservoir}`, transparent streaming decompression for `.gz` / `.zst` / `.bz2` / `.xz`, multi-threaded `shuflr convert --verify`, `shuflr info`, `shuflr index` with fingerprint-based sidecar reuse, `--rank R --world-size W` disjoint partitioning on all shuffle modes, and indicatif-based progress bars for `shuflr convert` (real bar on plain inputs, spinner on compressed; TTY-gated via `--progress=never|auto|always`). Five of six v1 shuffle modes live. 126 tests green. Next: `shuflr analyze` for source-order locality detection (ML-review recommendation), or `chunk-rr` + README + release prep.
 
 ## Upstream
 
