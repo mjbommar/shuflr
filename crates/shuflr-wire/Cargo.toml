@@ -1,0 +1,20 @@
+[package]
+name = "shuflr-wire"
+description = "shuflr-wire/1 binary protocol codec — framing, parsing, xxh3 checksums (005 §3)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = "2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[dev-dependencies]
+proptest = "1"

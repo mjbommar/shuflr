@@ -4,6 +4,7 @@ members = [
     "crates/shuflr",
     "crates/shuflr-cli",
     "crates/shuflr-client",
+    "crates/shuflr-wire",
 ]
 
 [workspace.package]
