@@ -315,6 +315,85 @@ fn chunk_shuffled_on_seekable_zstd_works_end_to_end() {
 }
 
 #[test]
+fn index_perm_on_seekable_zstd_builds_sidecar_and_is_deterministic() {
+    use std::collections::BTreeSet;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let in_path = tmp.path().join("in.jsonl");
+    let seekable_path = tmp.path().join("in.jsonl.zst");
+    let sidecar_path = tmp.path().join("in.jsonl.zst.shuflr-idx-zst");
+
+    let records: Vec<String> = (0..400).map(|i| format!("{{\"i\":{i:03}}}\n")).collect();
+    std::fs::write(&in_path, records.concat()).unwrap();
+
+    shuflr()
+        .args(["convert", "--log-level", "warn", "-o"])
+        .arg(&seekable_path)
+        .arg(&in_path)
+        .assert()
+        .success();
+
+    assert!(
+        !sidecar_path.exists(),
+        "sidecar must not exist before first index-perm run"
+    );
+
+    let run = |seed: &str| {
+        let out = shuflr()
+            .args([
+                "stream",
+                "--shuffle",
+                "index-perm",
+                "--seed",
+                seed,
+                "--log-level",
+                "warn",
+            ])
+            .arg(&seekable_path)
+            .assert()
+            .success();
+        String::from_utf8(out.get_output().stdout.clone()).unwrap()
+    };
+
+    let out_a = run("7");
+    assert!(
+        sidecar_path.exists(),
+        "sidecar must be created on first run: {}",
+        sidecar_path.display()
+    );
+    let sidecar_mtime_a = std::fs::metadata(&sidecar_path)
+        .unwrap()
+        .modified()
+        .unwrap();
+
+    // Same seed → byte-identical output on second run (sidecar-loaded path).
+    let out_b = run("7");
+    assert_eq!(
+        out_a, out_b,
+        "same seed must give byte-identical output across runs"
+    );
+
+    // Sidecar must not have been rewritten on the second run.
+    let sidecar_mtime_b = std::fs::metadata(&sidecar_path)
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_eq!(
+        sidecar_mtime_a, sidecar_mtime_b,
+        "fresh sidecar must not be overwritten on a cache-hit run"
+    );
+
+    // Different seed → different order, same multiset.
+    let out_c = run("8");
+    assert_ne!(out_a, out_c);
+
+    let in_set: BTreeSet<&str> = records.iter().map(|s| s.trim_end()).collect();
+    let out_set: BTreeSet<&str> = out_a.lines().collect();
+    assert_eq!(in_set, out_set, "multiset preserved under index-perm");
+    assert_ne!(out_a, records.concat(), "index-perm must actually reorder");
+}
+
+#[test]
 fn stream_none_honors_sample() {
     let path = tiny_corpus();
     let assert = shuflr()
