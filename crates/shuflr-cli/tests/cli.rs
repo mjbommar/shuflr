@@ -758,6 +758,43 @@ fn index_subcommand_builds_sidecar() {
 }
 
 #[test]
+fn index_subcommand_builds_seekable_zstd_sidecar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = tmp.path().join("data.jsonl");
+    let seekable = tmp.path().join("data.jsonl.zst");
+    let records: Vec<String> = (0..50).map(|i| format!("{{\"i\":{i:03}}}\n")).collect();
+    std::fs::write(&plain, records.concat()).unwrap();
+
+    shuflr()
+        .args(["convert", "--log-level", "warn", "-o"])
+        .arg(&seekable)
+        .arg(&plain)
+        .assert()
+        .success();
+
+    // `shuflr index` on a seekable-zstd file should dispatch to the
+    // record-index builder and drop a .shuflr-idx-zst sidecar.
+    shuflr().args(["index"]).arg(&seekable).assert().success();
+
+    let sidecar = tmp.path().join("data.jsonl.zst.shuflr-idx-zst");
+    assert!(
+        sidecar.exists(),
+        "seekable-zstd sidecar must exist: {}",
+        sidecar.display()
+    );
+    let bytes = std::fs::read(&sidecar).unwrap();
+    // 8 magic + 1 version + 7 reserved + 32 fingerprint + 8 count + 12·N entries
+    // For N=50: 56 + 600 = 656.
+    assert_eq!(
+        bytes.len(),
+        656,
+        "unexpected seekable-zstd sidecar size: {} bytes (expected 656)",
+        bytes.len(),
+    );
+    assert_eq!(&bytes[..8], b"SHUFLRZI");
+}
+
+#[test]
 fn stream_index_perm_builds_index_on_demand() {
     use std::collections::BTreeSet;
 
