@@ -155,19 +155,222 @@ pub fn serve(_args: cli::ServeArgs) -> exit::Code {
 }
 
 #[cfg(feature = "zstd")]
-pub fn convert(_args: cli::ConvertArgs) -> exit::Code {
-    stub(
-        "convert",
-        "004 §1–§4; targeted for PR-4 (record-aligned seekable writer)".into(),
-    )
+pub fn convert(args: cli::ConvertArgs) -> exit::Code {
+    match convert_inner(args) {
+        Ok(()) => exit::Code::Ok,
+        Err(e) => report_library_error(&e),
+    }
 }
 
 #[cfg(feature = "zstd")]
-pub fn info(_args: cli::InfoArgs) -> exit::Code {
-    stub(
-        "info",
-        "004 §5; lands with PR-4 alongside the seekable writer".into(),
-    )
+fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
+    use shuflr::io::zstd_seekable::{Writer, WriterConfig};
+    use std::io::{BufReader, Read};
+    use std::time::Instant;
+
+    if args.input.inputs.len() != 1 {
+        return Err(shuflr::Error::Input(
+            "PR-4 `convert` accepts exactly one input; multi-input merge \
+             lands in PR-5. Use '-' to read from stdin."
+                .to_string(),
+        ));
+    }
+    let in_path = &args.input.inputs[0];
+    let frame_size = usize::try_from(args.frame_size).map_err(|_| {
+        shuflr::Error::Input(format!(
+            "--frame-size {} too large for this build",
+            args.frame_size
+        ))
+    })?;
+
+    let input = shuflr::io::Input::open(in_path)?;
+    tracing::info!(
+        path = %in_path.display(),
+        raw_format = ?input.raw_format(),
+        frame_size,
+        level = args.level,
+        record_aligned = !args.no_record_align,
+        checksums = !args.no_checksum,
+        "opened input for convert",
+    );
+
+    // Open the output sink. Not Send-bounded because convert is
+    // single-threaded in PR-4; multithreaded compress lands in PR-5.
+    let output: Box<dyn std::io::Write> = if args.output == std::path::Path::new("-") {
+        Box::new(std::io::stdout().lock())
+    } else {
+        let file = std::fs::File::create(&args.output).map_err(shuflr::Error::Io)?;
+        Box::new(file)
+    };
+
+    let cfg = WriterConfig {
+        level: args.level as i32,
+        frame_size,
+        checksums: !args.no_checksum,
+        record_aligned: !args.no_record_align,
+    };
+    let mut writer = Writer::new(output, cfg);
+
+    let started = Instant::now();
+    let mut reader = BufReader::with_capacity(2 * 1024 * 1024, input);
+    let mut buf = vec![0u8; 2 * 1024 * 1024];
+    loop {
+        let n = reader.read(&mut buf).map_err(shuflr::Error::Io)?;
+        if n == 0 {
+            break;
+        }
+        writer.write_block(&buf[..n])?;
+    }
+    let stats = writer.finish()?;
+    let elapsed = started.elapsed();
+
+    let ratio = if stats.uncompressed_bytes > 0 {
+        stats.compressed_bytes as f64 / stats.uncompressed_bytes as f64
+    } else {
+        0.0
+    };
+    tracing::info!(
+        output = %args.output.display(),
+        frames = stats.frames,
+        records = stats.records,
+        uncompressed_bytes = stats.uncompressed_bytes,
+        compressed_bytes = stats.compressed_bytes,
+        seek_table_bytes = stats.seek_table_bytes,
+        ratio = ratio,
+        throughput_mb_s = (stats.uncompressed_bytes as f64) / elapsed.as_secs_f64() / 1_048_576.0,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "convert done",
+    );
+
+    if args.verify {
+        tracing::warn!("--verify is a PR-5 feature; skipping post-write verification");
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "zstd")]
+pub fn info(args: cli::InfoArgs) -> exit::Code {
+    match info_inner(args) {
+        Ok(()) => exit::Code::Ok,
+        Err(e) => report_library_error(&e),
+    }
+}
+
+#[cfg(feature = "zstd")]
+fn info_inner(args: cli::InfoArgs) -> shuflr::Result<()> {
+    use shuflr::io::zstd_seekable::SeekTable;
+    use std::io::Write as _;
+
+    let mut file = std::fs::File::open(&args.input).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => shuflr::Error::NotFound {
+            path: args.input.display().to_string(),
+        },
+        std::io::ErrorKind::PermissionDenied => shuflr::Error::PermissionDenied {
+            path: args.input.display().to_string(),
+        },
+        _ => shuflr::Error::Io(e),
+    })?;
+    let total_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+
+    let table = SeekTable::read_from_tail(&mut file).map_err(shuflr::Error::Io)?;
+    let total_decompressed = table.total_decompressed();
+    let total_compressed_payload = table.total_compressed();
+    let ratio = if total_compressed_payload > 0 {
+        total_decompressed as f64 / total_compressed_payload as f64
+    } else {
+        0.0
+    };
+
+    let mut stdout = std::io::stdout().lock();
+    if args.json {
+        let mut sizes: Vec<u32> = table.entries.iter().map(|e| e.decompressed_size).collect();
+        let min_frame = sizes.iter().min().copied().unwrap_or(0);
+        let max_frame = sizes.iter().max().copied().unwrap_or(0);
+        let med_frame = median(&mut sizes);
+        writeln!(
+            stdout,
+            "{{\
+\"file\":\"{path}\",\
+\"format\":\"zstd-seekable\",\
+\"frames\":{frames},\
+\"compressed_bytes\":{compressed},\
+\"decompressed_bytes\":{decompressed},\
+\"ratio\":{ratio:.3},\
+\"checksums\":{checksums},\
+\"frame_size_min\":{min_frame},\
+\"frame_size_max\":{max_frame},\
+\"frame_size_median\":{med_frame}\
+}}",
+            path = args.input.display(),
+            frames = table.num_frames(),
+            compressed = total_size,
+            decompressed = total_decompressed,
+            ratio = ratio,
+            checksums = table.with_checksums,
+        )
+        .map_err(shuflr::Error::Io)?;
+    } else {
+        writeln!(stdout, "file:           {}", args.input.display()).map_err(shuflr::Error::Io)?;
+        writeln!(stdout, "format:         zstd-seekable").map_err(shuflr::Error::Io)?;
+        writeln!(stdout, "frames:         {}", table.num_frames()).map_err(shuflr::Error::Io)?;
+        writeln!(stdout, "compressed:     {}", humanize_bytes(total_size))
+            .map_err(shuflr::Error::Io)?;
+        writeln!(
+            stdout,
+            "decompressed:   {} (ratio {ratio:.2})",
+            humanize_bytes(total_decompressed),
+        )
+        .map_err(shuflr::Error::Io)?;
+        if !table.entries.is_empty() {
+            let mut sizes: Vec<u32> = table.entries.iter().map(|e| e.decompressed_size).collect();
+            let min_frame = *sizes.iter().min().unwrap_or(&0);
+            let max_frame = *sizes.iter().max().unwrap_or(&0);
+            let med_frame = median(&mut sizes);
+            writeln!(
+                stdout,
+                "frame size:     min {}, median {}, max {}",
+                humanize_bytes(min_frame as u64),
+                humanize_bytes(med_frame as u64),
+                humanize_bytes(max_frame as u64),
+            )
+            .map_err(shuflr::Error::Io)?;
+        }
+        writeln!(
+            stdout,
+            "checksum:       {}",
+            if table.with_checksums {
+                "XXH64 per frame"
+            } else {
+                "none"
+            }
+        )
+        .map_err(shuflr::Error::Io)?;
+        writeln!(
+            stdout,
+            "seekable:       yes (direct chunk-shuffled / index-perm compatible after PR-7)"
+        )
+        .map_err(shuflr::Error::Io)?;
+    }
+    Ok(())
+}
+
+fn median(sizes: &mut [u32]) -> u32 {
+    if sizes.is_empty() {
+        return 0;
+    }
+    sizes.sort_unstable();
+    sizes[sizes.len() / 2]
+}
+
+fn humanize_bytes(n: u64) -> String {
+    const UNITS: &[(&str, u64)] = &[("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)];
+    for (name, size) in UNITS {
+        if n >= *size {
+            return format!("{:.2} {}", n as f64 / *size as f64, name);
+        }
+    }
+    format!("{n} B")
 }
 
 pub fn analyze(_args: cli::AnalyzeArgs) -> exit::Code {

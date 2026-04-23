@@ -263,6 +263,131 @@ fn stream_none_exit_65_on_fail_policy() {
 }
 
 #[test]
+fn convert_plain_jsonl_roundtrips_via_zstdcat() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input_path = tmp.path().join("in.jsonl");
+    let output_path = tmp.path().join("out.jsonl.zst");
+
+    let content = (0..500)
+        .map(|i| format!("{{\"i\":{i},\"t\":\"record number {i}\"}}\n"))
+        .collect::<String>();
+    std::fs::write(&input_path, &content).unwrap();
+
+    shuflr()
+        .args(["convert", "--log-level", "warn", "-o"])
+        .arg(&output_path)
+        .arg(&input_path)
+        .assert()
+        .success();
+
+    // Output must be decodable by any standard zstd reader and reproduce the input.
+    let compressed = std::fs::read(&output_path).unwrap();
+    let decoded = zstd::stream::decode_all(&compressed[..]).unwrap();
+    assert_eq!(decoded, content.as_bytes());
+}
+
+#[test]
+fn info_reports_seekable_table_of_converted_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input_path = tmp.path().join("in.jsonl");
+    let output_path = tmp.path().join("out.jsonl.zst");
+
+    // Larger than default 2 MiB frame size so the output has multiple frames.
+    let mut content = String::new();
+    for i in 0..100_000 {
+        content.push_str(&format!(
+            "{{\"i\":{i},\"pad\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}}\n"
+        ));
+    }
+    std::fs::write(&input_path, &content).unwrap();
+
+    shuflr()
+        .args(["convert", "--log-level", "warn", "-o"])
+        .arg(&output_path)
+        .arg(&input_path)
+        .assert()
+        .success();
+
+    let assert = shuflr().args(["info"]).arg(&output_path).assert().success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(out.contains("format:"), "info missing 'format:':\n{out}");
+    assert!(
+        out.contains("zstd-seekable"),
+        "info missing codec name:\n{out}"
+    );
+    assert!(out.contains("frames:"), "info missing frames count:\n{out}");
+    assert!(
+        out.contains("XXH64"),
+        "checksums should be on by default:\n{out}"
+    );
+}
+
+#[test]
+fn info_json_mode_parses_cleanly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input_path = tmp.path().join("in.jsonl");
+    let output_path = tmp.path().join("out.jsonl.zst");
+    std::fs::write(&input_path, "a\nb\nc\n").unwrap();
+
+    shuflr()
+        .args(["convert", "--log-level", "warn", "-o"])
+        .arg(&output_path)
+        .arg(&input_path)
+        .assert()
+        .success();
+
+    let assert = shuflr()
+        .args(["info", "--json"])
+        .arg(&output_path)
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(out.trim().starts_with('{') && out.trim().ends_with('}'));
+    assert!(out.contains("\"format\":\"zstd-seekable\""));
+    assert!(out.contains("\"frames\":"));
+}
+
+#[test]
+fn convert_rejects_multi_input_in_pr4() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.jsonl");
+    let b = tmp.path().join("b.jsonl");
+    let o = tmp.path().join("o.zst");
+    std::fs::write(&a, "x\n").unwrap();
+    std::fs::write(&b, "y\n").unwrap();
+
+    shuflr()
+        .args(["convert", "-o"])
+        .arg(&o)
+        .arg(&a)
+        .arg(&b)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("PR-4"));
+}
+
+#[test]
+fn convert_preserves_crlf_and_nul() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input_path = tmp.path().join("in.jsonl");
+    let output_path = tmp.path().join("out.jsonl.zst");
+    // Nasty bytes: CRLF, embedded NUL, multi-byte UTF-8.
+    let original: &[u8] = b"one\r\nt\0wo\n\xe2\x98\x83snowman\n";
+    std::fs::write(&input_path, original).unwrap();
+
+    shuflr()
+        .args(["convert", "--log-level", "warn", "-o"])
+        .arg(&output_path)
+        .arg(&input_path)
+        .assert()
+        .success();
+
+    let compressed = std::fs::read(&output_path).unwrap();
+    let decoded = zstd::stream::decode_all(&compressed[..]).unwrap();
+    assert_eq!(decoded, original);
+}
+
+#[test]
 fn stream_none_exit_66_on_missing_input() {
     shuflr()
         .args(["stream", "--shuffle", "none", "/does/not/exist.jsonl"])

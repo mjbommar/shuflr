@@ -5,6 +5,8 @@
 //! I/O (pread, mmap, io_uring, zstd_seekable) arrives in later PRs.
 
 pub mod magic;
+#[cfg(feature = "zstd")]
+pub mod zstd_seekable;
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
