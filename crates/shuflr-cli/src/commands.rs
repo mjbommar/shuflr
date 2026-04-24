@@ -912,8 +912,22 @@ fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
                 tracing::info!(repo = %repo, "parquet input via HF Hub (lazy shard fetch)");
                 let hf = shuflr::parquet_input::HfShardSource::open(&s)?;
                 shuflr::parquet_input::ParquetJsonlReader::from_hf(hf, project)
+            } else if in_path.is_dir() {
+                let shards = shuflr::parquet_input::list_parquet_shards(in_path)?;
+                if shards.is_empty() {
+                    return Err(shuflr::Error::Input(format!(
+                        "parquet input: directory {} contains no .parquet files",
+                        in_path.display()
+                    )));
+                }
+                tracing::info!(
+                    dir = %in_path.display(),
+                    shards = shards.len(),
+                    "parquet input (local directory of shards)",
+                );
+                shuflr::parquet_input::ParquetJsonlReader::new(shards, project)
             } else {
-                tracing::info!(path = %in_path.display(), "parquet input (local)");
+                tracing::info!(path = %in_path.display(), "parquet input (local file)");
                 shuflr::parquet_input::ParquetJsonlReader::new(
                     vec![in_path.clone()],
                     project,

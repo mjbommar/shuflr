@@ -379,6 +379,22 @@ fn serialize_row(batch: &RecordBatch, row: usize) -> Result<String> {
                     let bytes = col.as_binary::<i32>().value(row);
                     Value::String(hex_lowercase(bytes))
                 }
+                DataType::List(_) | DataType::LargeList(_) => {
+                    // Tokenized MLM records are List<Int64> of 128-ish
+                    // token ids. Emit as a JSON array. We fetch the
+                    // inner array as an ArrayRef, then iterate.
+                    let list_arr = col.as_any().downcast_ref::<arrow_array::ListArray>();
+                    if let Some(la) = list_arr {
+                        let inner = la.value(row);
+                        Value::Array(arrow_array_to_json_values(&inner))
+                    } else if let Some(la) = col.as_any().downcast_ref::<arrow_array::LargeListArray>() {
+                        let inner = la.value(row);
+                        Value::Array(arrow_array_to_json_values(&inner))
+                    } else {
+                        tracing::warn!(column = %name, "list column downcast failed");
+                        Value::Null
+                    }
+                }
                 other => {
                     tracing::warn!(
                         column = %name,
@@ -396,6 +412,47 @@ fn serialize_row(batch: &RecordBatch, row: usize) -> Result<String> {
         .map_err(|e| Error::Input(format!("json serialize row: {e}")))
 }
 
+/// Convert an Arrow array (the inner element of a List column) to a
+/// Vec<Value> for JSON emission. Handles primitive numeric types that
+/// commonly appear inside MLM token arrays (Int64, Int32, Int16, Int8,
+/// UInt variants, Float32/64, Boolean, Utf8). Nulls map to Value::Null.
+fn arrow_array_to_json_values(arr: &dyn arrow_array::Array) -> Vec<Value> {
+    use arrow_array::cast::AsArray;
+    let n = arr.len();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        if arr.is_null(i) {
+            out.push(Value::Null);
+            continue;
+        }
+        let v = match arr.data_type() {
+            DataType::Int8 => Value::from(arr.as_primitive::<arrow_array::types::Int8Type>().value(i)),
+            DataType::Int16 => Value::from(arr.as_primitive::<arrow_array::types::Int16Type>().value(i)),
+            DataType::Int32 => Value::from(arr.as_primitive::<arrow_array::types::Int32Type>().value(i)),
+            DataType::Int64 => Value::from(arr.as_primitive::<arrow_array::types::Int64Type>().value(i)),
+            DataType::UInt8 => Value::from(arr.as_primitive::<arrow_array::types::UInt8Type>().value(i)),
+            DataType::UInt16 => Value::from(arr.as_primitive::<arrow_array::types::UInt16Type>().value(i)),
+            DataType::UInt32 => Value::from(arr.as_primitive::<arrow_array::types::UInt32Type>().value(i)),
+            DataType::UInt64 => Value::from(arr.as_primitive::<arrow_array::types::UInt64Type>().value(i)),
+            DataType::Float32 => serde_json::Number::from_f64(
+                arr.as_primitive::<arrow_array::types::Float32Type>().value(i) as f64,
+            )
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+            DataType::Float64 => serde_json::Number::from_f64(
+                arr.as_primitive::<arrow_array::types::Float64Type>().value(i),
+            )
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+            DataType::Boolean => Value::Bool(arr.as_boolean().value(i)),
+            DataType::Utf8 => Value::String(arr.as_string::<i32>().value(i).to_string()),
+            _ => Value::Null,
+        };
+        out.push(v);
+    }
+    out
+}
+
 fn hex_lowercase(bytes: &[u8]) -> String {
     const H: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -406,13 +463,51 @@ fn hex_lowercase(bytes: &[u8]) -> String {
     s
 }
 
-/// Recognize a path as a parquet input. Both local `.parquet` and `hf://` URLs.
+/// Recognize a path as a parquet input. Accepts:
+///   - `hf://user/repo[@rev]` URLs
+///   - single `.parquet` files
+///   - directories whose name ends with `.parquet.d/` OR which contain
+///     `*.parquet` files (the dir is a shard collection — common HF
+///     download layout or materialized MLM shards)
 pub fn looks_like_parquet_input(path: &Path) -> bool {
     let as_str = path.to_string_lossy();
     if as_str.starts_with("hf://") {
         return true;
     }
-    path.extension().is_some_and(|e| e == "parquet")
+    if path.extension().is_some_and(|e| e == "parquet") {
+        return true;
+    }
+    // Directory containing parquet shards?
+    if path.is_dir() {
+        if let Ok(mut entries) = std::fs::read_dir(path) {
+            return entries.any(|e| {
+                e.ok()
+                    .map(|e| {
+                        e.path()
+                            .extension()
+                            .is_some_and(|ext| ext == "parquet")
+                    })
+                    .unwrap_or(false)
+            });
+        }
+    }
+    false
+}
+
+/// List all parquet files in a directory, sorted by name. Used when the
+/// CLI input is a directory of shards (e.g. `/data0/.../mlm/cfr/` with
+/// train-NNNNN.parquet files). Returns empty vec if no shards found.
+pub fn list_parquet_shards(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut shards: Vec<PathBuf> = Vec::new();
+    let iter = std::fs::read_dir(dir).map_err(Error::Io)?;
+    for entry in iter {
+        let p = entry.map_err(Error::Io)?.path();
+        if p.extension().is_some_and(|e| e == "parquet") {
+            shards.push(p);
+        }
+    }
+    shards.sort();
+    Ok(shards)
 }
 
 #[cfg(test)]
@@ -446,5 +541,45 @@ mod tests {
         assert!(looks_like_parquet_input(Path::new("/x/y.parquet")));
         assert!(!looks_like_parquet_input(Path::new("data.jsonl")));
         assert!(!looks_like_parquet_input(Path::new("data.jsonl.zst")));
+    }
+
+    #[test]
+    fn list_parquet_shards_sorted() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["train-00002.parquet", "train-00000.parquet", "other.txt", "train-00001.parquet"] {
+            let mut f = std::fs::File::create(dir.path().join(name)).unwrap();
+            f.write_all(b"x").unwrap();
+        }
+        let shards = list_parquet_shards(dir.path()).unwrap();
+        let names: Vec<String> = shards
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "train-00000.parquet".to_string(),
+                "train-00001.parquet".to_string(),
+                "train-00002.parquet".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn looks_like_parquet_recognizes_dir_with_shards() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::File::create(dir.path().join("train-00000.parquet"))
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+        assert!(looks_like_parquet_input(dir.path()));
+    }
+
+    #[test]
+    fn looks_like_parquet_rejects_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!looks_like_parquet_input(dir.path()));
     }
 }

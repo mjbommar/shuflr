@@ -6,6 +6,7 @@ A Rust CLI and service for streaming large JSONL files in shuffled order, withou
 
 - A **swiss-army knife** for non-serial consumption of very large JSONL files — LLM training corpora, event logs, sampled datasets.
 - Usable as a **CLI pipe** (stdout, jq/netcat-style) *or* as a **network service** (gRPC streaming; TCP/UDS; HTTP/2 later).
+- An **ingest surface for parquet + HuggingFace Hub** (with `--features parquet`) — `shuflr convert hf://user/repo ...` or `shuflr convert /path/to/shards/ ...` reads columnar data, projects columns, applies sampling/entropy filters, and writes seekable-zstd in one pass.
 - Optimized for **low preprocessing, low memory, high throughput** — the default mode does no pre-scan of the file.
 
 ## What this tool is **not**
@@ -87,6 +88,13 @@ Through PR-28. Highlights since PR-14: PR-15 (visible WARN on silently-dropped o
 **179 tests green.** Both hot-path emit modes (`chunk-shuffled` and `index-perm` on seekable-zstd) now have prefetch-pipeline parallel variants. `--emit-threads=N --emit-prefetch=K` is shared across modes; default stays `--emit-threads=1` (no behavior change without opt-in).
 
 Through **PR-34b**: HTTP transport with rustls TLS 1.3 + bearer/mTLS auth (PR-30/31), `shuflr-wire/1` codec crate (PR-32), wire transport inside `serve` speaking TCP + optional TLS with `plain-batch` mode for all 5 shuffle modes (PR-33), and the Python client (`shuflr-client`) speaking both HTTP and `shuflr://` wire (PR-34a/b). `shuflr serve --wire 127.0.0.1:9443 --http 127.0.0.1:9000 ...` runs both listeners simultaneously under one Ctrl-C.
+
+**PR-37 (2026-04-24) — parquet + HF Hub input for `shuflr convert`** behind the `parquet` cargo feature. Graduates `Parquet / Arrow IPC input` from the "v2" row of 002 §Deferred to shipped v1.x. New input forms:
+- `shuflr convert hf://<namespace>/<repo>[@revision] -o out.jsonl.zst` — fetches parquet shards from HF Hub lazily (one at a time; `--limit N` does not over-download).
+- `shuflr convert /path/to/file.parquet -o ...` — single local parquet.
+- `shuflr convert /path/to/dir/ -o ...` — directory of parquet shards, read in sorted order.
+- `--parquet-project col1,col2,...` — column projection at the parquet reader level (unread columns never decoded; ~50% decode savings on wide data).
+Parquet rows serialize to JSONL bytes in-memory and pass through the existing SamplingReader + entropy filter + seekable-zstd writer. Handles primitive types + `List<*>` arrays (for pre-tokenized MLM). Feature is additive — builds without `--features parquet` see zero cost.
 
 Remaining 005 PRs: **33a** credit-based flow control — **33b** raw-frame passthrough for chunk-shuffled (~6× wire savings) — **33c** zstd-batch compression — **33d** UDS listener — **34c** `shuflr-client` speaks `shuflrs://` (TLS) — **35** gRPC — **36** observability.
 
