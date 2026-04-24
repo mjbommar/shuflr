@@ -897,13 +897,49 @@ fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
         ))
     })?;
 
-    let input = open_convert_input(in_path, args.input_format)?;
+    // Parquet / HF Hub dispatch: local `.parquet` or `hf://user/repo` URL
+    // becomes a ParquetJsonlReader that produces JSONL bytes on-the-fly.
+    // Everything downstream (sampling, entropy, writer) sees bytes, same as
+    // the plain/gzip/zstd paths.
+    #[cfg(feature = "parquet")]
+    let parquet_source: Option<Box<dyn std::io::Read + Send>> = {
+        let s = in_path.to_string_lossy();
+        if shuflr::parquet_input::looks_like_parquet_input(in_path) {
+            let project = args.parquet_project.clone();
+            let reader = if let Some((repo, _rev)) =
+                shuflr::parquet_input::parse_hf_url(&s)
+            {
+                tracing::info!(repo = %repo, "parquet input via HF Hub (lazy shard fetch)");
+                let hf = shuflr::parquet_input::HfShardSource::open(&s)?;
+                shuflr::parquet_input::ParquetJsonlReader::from_hf(hf, project)
+            } else {
+                tracing::info!(path = %in_path.display(), "parquet input (local)");
+                shuflr::parquet_input::ParquetJsonlReader::new(
+                    vec![in_path.clone()],
+                    project,
+                )
+            };
+            Some(Box::new(reader))
+        } else {
+            None
+        }
+    };
+    #[cfg(not(feature = "parquet"))]
+    let parquet_source: Option<Box<dyn std::io::Read + Send>> = None;
+
+    let (plain_input, input_size) = if parquet_source.is_some() {
+        (None, None)
+    } else {
+        let input = open_convert_input(in_path, args.input_format)?;
+        let size = input.size_hint();
+        (Some(input), size)
+    };
     let effective_threads = resolve_threads(args.threads as usize);
-    let input_size = input.size_hint();
     tracing::info!(
         path = %in_path.display(),
-        raw_format = ?input.raw_format(),
+        raw_format = ?plain_input.as_ref().map(|i| i.raw_format()),
         input_format_override = ?args.input_format,
+        parquet = parquet_source.is_some(),
         frame_size,
         level = args.level,
         threads = effective_threads,
@@ -921,15 +957,20 @@ fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
 
     // Build the progress bar if --progress allows it. For compressed inputs the
     // decompressed size is unknown; we fall back to a spinner by passing `None`.
+    // Parquet input has no meaningful byte size hint — spinner.
     let show_progress = progress::should_show(args.progress);
     let bar = if show_progress {
-        let total = if input.raw_format() == shuflr::io::magic::Format::Plain
+        let total = if parquet_source.is_none()
+            && plain_input
+                .as_ref()
+                .map(|i| i.raw_format() == shuflr::io::magic::Format::Plain)
+                .unwrap_or(false)
             && args.sample_rate.is_none()
             && args.limit.is_none()
         {
             input_size
         } else {
-            // Under filtering, output size is unknown; use a spinner.
+            // Under filtering or non-plain input, output size is unknown.
             None
         };
         Some(progress::new_bar(total, "convert"))
@@ -960,10 +1001,21 @@ fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
 
     // Compose the reader stack from bottom to top:
     //   Input  →  ProgressReader  →  SamplingReader  →  (writer input)
+    //
+    // Pick the base reader: parquet (if dispatched) or the plain file path.
+    let base_reader: Box<dyn Read + Send> = if let Some(r) = parquet_source {
+        r
+    } else if let Some(inp) = plain_input {
+        Box::new(inp)
+    } else {
+        return Err(shuflr::Error::Input(
+            "internal: no input reader selected".to_string(),
+        ));
+    };
     let progress_bar = bar.clone();
     let with_progress: Box<dyn Read + Send> = match progress_bar {
-        Some(pb) => Box::new(progress::ProgressReader::new(input, pb)),
-        None => Box::new(input),
+        Some(pb) => Box::new(progress::ProgressReader::new(base_reader, pb)),
+        None => base_reader,
     };
     let source: Box<dyn Read + Send> = if sampling_active {
         Box::new(shuflr::SamplingReader::with_config(

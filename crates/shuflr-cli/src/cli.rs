@@ -314,6 +314,14 @@ pub struct ConvertArgs {
     #[arg(long, env = "SHUFLR_SEED", value_name = "U64")]
     pub seed: Option<u64>,
 
+    /// Parquet column projection (comma-separated). Only decoded if input is
+    /// parquet (local `.parquet` file or `hf://` URL). Columns not listed
+    /// are never decoded — cheap projection at the parquet reader level.
+    /// Omit to project all columns.
+    #[cfg(feature = "parquet")]
+    #[arg(long, value_name = "COL1,COL2,...", value_delimiter = ',')]
+    pub parquet_project: Option<Vec<String>>,
+
     /// Progress bar visibility
     #[arg(long, value_enum, default_value_t = When::Auto, value_name = "WHEN")]
     pub progress: When,

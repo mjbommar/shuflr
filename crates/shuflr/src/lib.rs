@@ -12,6 +12,8 @@ pub mod framing;
 pub mod index;
 pub mod io;
 pub mod json_validate;
+#[cfg(feature = "parquet")]
+pub mod parquet_input;
 pub mod pipeline;
 pub mod sampling;
 pub mod seed;
