@@ -46,13 +46,15 @@ cargo install --path crates/shuflr-cli
 ```
 
 Default features include `gzip` + `zstd` decoders; add `--features bzip2,xz`
-if you need those codecs, or `--features full` for everything.
+if you need those codecs. The service surface is optional: install with
+`--features serve` for HTTP + `shuflr-wire/1`, or `--features full` for
+everything currently implemented.
 
 ## Quick start
 
 ```sh
-# Pipe-friendly: implicit `stream` subcommand on a bare path
-shuflr file.jsonl | jq -r '.text' | head
+# Pipe-friendly passthrough for plain JSONL
+shuflr --shuffle=none file.jsonl | jq -r '.text' | head
 
 # Explicit modes (any --shuffle flag works from top-level too)
 shuflr --shuffle=none     file.jsonl | head -n 1000
@@ -146,7 +148,8 @@ targets, testing strategy, "stdout is sacred" rule).
 ```sh
 cargo fmt --all -- --check        # style
 cargo clippy --workspace --all-targets -- -D warnings   # lint
-cargo test --workspace --all-targets                    # ~180 tests
+cargo test --workspace --all-targets                    # default Rust tests
+cargo test -p shuflr-cli --tests --features serve       # HTTP/wire service tests
 cargo bench --bench throughput    # criterion baselines
 ```
 

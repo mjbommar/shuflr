@@ -30,7 +30,8 @@ const SUBCOMMAND_NAMES: &[&str] = &[
     about = "Stream large JSONL in shuffled order, without loading it into memory.",
     long_about = "shuflr streams records from JSONL files (optionally compressed) in \
                   shuffled order without loading the file into memory. Works as a CLI \
-                  pipe or a gRPC service. See the subcommands for specific workflows; \
+                  pipe; builds with --features serve also expose HTTP and shuflr-wire/1 \
+                  listeners. See the subcommands for specific workflows; \
                   `shuflr file.jsonl` is shorthand for `shuflr stream file.jsonl`.",
     disable_help_subcommand = true,
     arg_required_else_help = true
@@ -45,7 +46,7 @@ pub enum Command {
     /// Stream shuffled records to stdout (default when no subcommand given)
     Stream(StreamArgs),
 
-    /// Serve shuffled records over HTTP (and, when compiled, gRPC / wire)
+    /// Serve shuffled records over HTTP and shuflr-wire/1
     #[cfg(feature = "serve")]
     Serve(ServeArgs),
 
@@ -195,7 +196,7 @@ pub struct ServeArgs {
     #[arg(long, value_name = "ADDR")]
     pub wire: Option<String>,
 
-    /// gRPC listener (PR-35). Only available with --features grpc.
+    /// Reserved gRPC listener flag (PR-35; currently returns a startup error).
     #[cfg(feature = "grpc")]
     #[arg(long, value_name = "ADDR")]
     pub grpc: Option<String>,

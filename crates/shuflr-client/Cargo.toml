@@ -25,7 +25,7 @@ pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
 # Blocking HTTP/1.1 client. No tokio, no async. One crate, few deps —
 # important for wheel size and for compatibility with PyTorch's
 # multiprocessing workers (no runtime to fork across).
-ureq = { version = "2", default-features = false, features = ["gzip"] }
+ureq = { version = "2", default-features = false, features = ["gzip", "tls"] }
 url = "2"
 thiserror = "2"
 # Binary wire transport (005 §2.2). Pulls in only codec + thiserror
@@ -35,6 +35,8 @@ shuflr-wire = { path = "../shuflr-wire" }
 # Lives inside the codec's opaque bytes; server uses the same crate.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-pemfile = "2"
 # Raw-frame passthrough (005 §3.5): decompress server-sent zstd
 # frames locally, then replay Fisher-Yates with the server-derived
 # ChaCha20 seed.

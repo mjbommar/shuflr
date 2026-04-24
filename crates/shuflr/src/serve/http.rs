@@ -529,8 +529,29 @@ fn run_pipeline(
     tx: tokio::sync::mpsc::Sender<std::result::Result<Frame<Bytes>, std::io::Error>>,
 ) -> Result<()> {
     let sink = TxWriter { tx };
-    let bufsink = std::io::BufWriter::with_capacity(256 * 1024, sink);
+    let mut bufsink = std::io::BufWriter::with_capacity(256 * 1024, sink);
 
+    let mut epoch = 0u64;
+    loop {
+        if epochs != 0 && epoch >= u64::from(epochs) {
+            break;
+        }
+        run_pipeline_epoch(path, shuffle, seed, epoch, sample, partition, &mut bufsink)?;
+        epoch += 1;
+    }
+    std::io::Write::flush(&mut bufsink).map_err(Error::Io)?;
+    Ok(())
+}
+
+fn run_pipeline_epoch(
+    path: &std::path::Path,
+    shuffle: &str,
+    seed: u64,
+    epoch: u64,
+    sample: Option<u64>,
+    partition: Option<(u32, u32)>,
+    sink: &mut impl std::io::Write,
+) -> Result<()> {
     match shuffle {
         "none" => {
             let input = crate::io::Input::open(path)?;
@@ -541,34 +562,34 @@ fn run_pipeline(
                 ensure_trailing_newline: true,
                 partition,
             };
-            crate::pipeline::passthrough(input, bufsink, &cfg)?;
+            crate::pipeline::passthrough(input, sink, &cfg)?;
             Ok(())
         }
         "buffer" => {
             let input = crate::io::Input::open(path)?;
             let cfg = crate::pipeline::BufferConfig {
                 buffer_size: 100_000,
-                seed,
+                seed: epoch_seed(seed, epoch),
                 max_line: 16 * 1024 * 1024,
                 on_error: OnError::Skip,
                 sample,
                 ensure_trailing_newline: true,
                 partition,
             };
-            crate::pipeline::buffer(input, bufsink, &cfg)?;
+            crate::pipeline::buffer(input, sink, &cfg)?;
             Ok(())
         }
         "reservoir" => {
             let input = crate::io::Input::open(path)?;
             let cfg = crate::pipeline::ReservoirConfig {
                 k: 10_000,
-                seed,
+                seed: epoch_seed(seed, epoch),
                 max_line: 16 * 1024 * 1024,
                 on_error: OnError::Skip,
                 ensure_trailing_newline: true,
                 partition,
             };
-            crate::pipeline::reservoir(input, bufsink, &cfg)?;
+            crate::pipeline::reservoir(input, sink, &cfg)?;
             Ok(())
         }
         #[cfg(feature = "zstd")]
@@ -576,7 +597,7 @@ fn run_pipeline(
             let reader = crate::io::zstd_seekable::SeekableReader::open(path)?;
             let cfg = crate::pipeline::ChunkShuffledConfig {
                 seed,
-                epoch: 0,
+                epoch,
                 max_line: 16 * 1024 * 1024,
                 on_error: OnError::Skip,
                 sample,
@@ -585,14 +606,14 @@ fn run_pipeline(
                 emit_threads: 1,
                 emit_prefetch: 8,
             };
-            crate::pipeline::chunk_shuffled(reader, bufsink, &cfg)?;
+            crate::pipeline::chunk_shuffled(reader, sink, &cfg)?;
             Ok(())
         }
         #[cfg(feature = "zstd")]
         "index-perm" => {
             let cfg = crate::pipeline::IndexPermZstdConfig {
                 seed,
-                epoch: 0,
+                epoch,
                 sample,
                 ensure_trailing_newline: true,
                 cache_capacity: crate::pipeline::index_perm_zstd::DEFAULT_CACHE_CAPACITY,
@@ -602,17 +623,23 @@ fn run_pipeline(
                 emit_threads: 1,
                 emit_prefetch: 32,
             };
-            crate::pipeline::index_perm_zstd(path, bufsink, &cfg)?;
+            crate::pipeline::index_perm_zstd(path, sink, &cfg)?;
             Ok(())
         }
         other => Err(Error::Input(format!(
             "shuffle mode '{other}' not supported on HTTP transport"
         ))),
-    }?;
-    // Cap unused epochs warning — we treat epochs > 1 as deferred for
-    // PR-30 (stream mode handles it; we'd need to orchestrate here).
-    let _ = epochs;
-    Ok(())
+    }
+}
+
+fn epoch_seed(seed: u64, epoch: u64) -> u64 {
+    if epoch == 0 {
+        return seed;
+    }
+    let key = crate::seed::Seed::new(seed).epoch(epoch);
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&key[..8]);
+    u64::from_le_bytes(bytes)
 }
 
 /// `io::Write` adapter that sends every non-empty `write` as one

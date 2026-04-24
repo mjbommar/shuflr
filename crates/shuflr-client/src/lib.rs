@@ -26,7 +26,7 @@ use pyo3::exceptions::{PyIOError, PyNotImplementedError, PyStopIteration, PyValu
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-/// Supported URL schemes as of PR-34a.
+/// Supported URL schemes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Transport {
     Http,
@@ -287,10 +287,13 @@ struct Dataset {
     stream: Option<Stream>,
     // Query-string settings.
     seed: u64,
+    epochs: u32,
     shuffle: String,
     sample: Option<u64>,
     rank: Option<u32>,
     world_size: Option<u32>,
+    auth_token: Option<String>,
+    tls_ca_cert: Option<String>,
     timeout_secs: f64,
 }
 
@@ -301,19 +304,26 @@ impl Dataset {
         url,
         *,
         seed = 0,
+        epochs = 1,
         shuffle = "chunk-shuffled".to_string(),
         sample = None,
         rank = None,
         world_size = None,
+        auth_token = None,
+        tls_ca_cert = None,
         timeout = 30.0,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         url: String,
         seed: u64,
+        epochs: u32,
         shuffle: String,
         sample: Option<u64>,
         rank: Option<u32>,
         world_size: Option<u32>,
+        auth_token: Option<String>,
+        tls_ca_cert: Option<String>,
         timeout: f64,
     ) -> PyResult<Self> {
         let target = parse_target(&url)?;
@@ -324,10 +334,13 @@ impl Dataset {
             target,
             stream: None,
             seed,
+            epochs,
             shuffle,
             sample,
             rank,
             world_size,
+            auth_token,
+            tls_ca_cert,
             timeout_secs: timeout,
         })
     }
@@ -404,10 +417,13 @@ impl Dataset {
                 let stream = open_http(
                     &self.target.raw,
                     self.seed,
+                    self.epochs,
                     &self.shuffle,
                     self.sample,
                     self.rank,
                     self.world_size,
+                    self.auth_token.as_deref(),
+                    self.tls_ca_cert.as_deref(),
                     self.timeout_secs,
                 )?;
                 self.stream = Some(Stream::Http(stream));
@@ -418,10 +434,12 @@ impl Dataset {
                     &self.target.raw,
                     &self.target.dataset_id,
                     self.seed,
+                    self.epochs,
                     &self.shuffle,
                     self.sample,
                     self.rank,
                     self.world_size,
+                    self.auth_token.as_deref(),
                     self.timeout_secs,
                 )?;
                 self.stream = Some(Stream::Wire(stream));
@@ -434,13 +452,17 @@ impl Dataset {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn open_http(
     base: &str,
     seed: u64,
+    epochs: u32,
     shuffle: &str,
     sample: Option<u64>,
     rank: Option<u32>,
     world_size: Option<u32>,
+    auth_token: Option<&str>,
+    tls_ca_cert: Option<&str>,
     timeout_secs: f64,
 ) -> PyResult<HttpStream> {
     let parsed = url::Url::parse(base)
@@ -459,6 +481,9 @@ fn open_http(
         if seed != 0 {
             q.append_pair("seed", &seed.to_string());
         }
+        if epochs != 1 {
+            q.append_pair("epochs", &epochs.to_string());
+        }
         q.append_pair("shuffle", shuffle);
         if let Some(n) = sample {
             q.append_pair("sample", &n.to_string());
@@ -469,14 +494,14 @@ fn open_http(
         }
     }
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs_f64(timeout_secs))
-        // No per-read timeout: we want to hold the stream open for
-        // long-running shuffles. If the user wants a deadline they
-        // can wrap with signal.alarm / threading.Timer.
-        .build();
-    let resp = agent
-        .get(stream_url.as_str())
+    let agent = build_http_agent(timeout_secs, tls_ca_cert)?;
+    let mut req = agent.get(stream_url.as_str());
+    let auth_header;
+    if let Some(token) = auth_token {
+        auth_header = format!("Bearer {token}");
+        req = req.set("Authorization", &auth_header);
+    }
+    let resp = req
         .call()
         .map_err(|e| PyIOError::new_err(format!("HTTP GET {stream_url}: {e}")))?;
 
@@ -499,6 +524,43 @@ fn open_http(
     })
 }
 
+fn build_http_agent(timeout_secs: f64, tls_ca_cert: Option<&str>) -> PyResult<ureq::Agent> {
+    let mut builder =
+        ureq::AgentBuilder::new().timeout_connect(Duration::from_secs_f64(timeout_secs));
+    // No per-read timeout: we want to hold the stream open for
+    // long-running shuffles. If the user wants a deadline they can wrap
+    // with signal.alarm / threading.Timer.
+    if let Some(ca_path) = tls_ca_cert {
+        let config = tls_config_from_ca(ca_path)?;
+        builder = builder.tls_config(std::sync::Arc::new(config));
+    }
+    Ok(builder.build())
+}
+
+fn tls_config_from_ca(ca_path: &str) -> PyResult<rustls::ClientConfig> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let file = std::fs::File::open(ca_path)
+        .map_err(|e| PyIOError::new_err(format!("open tls_ca_cert '{ca_path}': {e}")))?;
+    let mut reader = std::io::BufReader::new(file);
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| PyIOError::new_err(format!("read tls_ca_cert '{ca_path}': {e}")))?;
+    if certs.is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "tls_ca_cert '{ca_path}' contains no PEM certificates"
+        )));
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in certs {
+        roots
+            .add(cert)
+            .map_err(|e| PyValueError::new_err(format!("add tls_ca_cert '{ca_path}': {e}")))?;
+    }
+    Ok(rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth())
+}
+
 /// OpenStream payload — mirrors the server's `serve::wire::OpenStreamJson`.
 /// Kept in sync by shared field names; PR-35 will swap both for proto.
 #[derive(serde::Serialize)]
@@ -506,6 +568,8 @@ struct OpenStreamJson<'a> {
     dataset_id: &'a str,
     seed: u64,
     shuffle: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    epochs: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sample: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -524,10 +588,12 @@ fn open_wire_tcp(
     url_str: &str,
     dataset_id: &str,
     seed: u64,
+    epochs: u32,
     shuffle: &str,
     sample: Option<u64>,
     rank: Option<u32>,
     world_size: Option<u32>,
+    auth_token: Option<&str>,
     timeout_secs: f64,
 ) -> PyResult<WireStream> {
     use shuflr_wire::{
@@ -567,6 +633,7 @@ fn open_wire_tcp(
         dataset_id,
         seed,
         shuffle,
+        epochs: (epochs != 1).then_some(epochs),
         sample,
         rank,
         world_size,
@@ -574,10 +641,14 @@ fn open_wire_tcp(
     };
     let open_json = serde_json::to_vec(&open)
         .map_err(|e| PyIOError::new_err(format!("encode OpenStream: {e}")))?;
+    let (auth_kind, auth) = match auth_token {
+        Some(token) => (AuthKind::Bearer, token.as_bytes().to_vec()),
+        None => (AuthKind::None, Vec::new()),
+    };
     let hello = Message::ClientHello(ClientHello {
         capability_flags: 0b111,
-        auth_kind: AuthKind::None,
-        auth: Vec::new(),
+        auth_kind,
+        auth,
         open_stream: open_json,
     });
     let encoded = encode(&hello);

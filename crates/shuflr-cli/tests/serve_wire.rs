@@ -175,6 +175,83 @@ fn fetch_records(
     })
 }
 
+fn fetch_records_with_meta(
+    port: u16,
+    open_stream_json: &str,
+) -> (Vec<Vec<u8>>, Vec<(u32, u64)>, (u64, u32), Vec<u32>) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let hello = Message::ClientHello(ClientHello {
+            capability_flags: 0,
+            auth_kind: AuthKind::None,
+            auth: vec![],
+            open_stream: open_stream_json.as_bytes().to_vec(),
+        });
+        s.write_all(&encode(&hello)).await.unwrap();
+        s.flush().await.unwrap();
+
+        let mut d = Decoder::new(DecodeOptions {
+            role: HandshakeRole::ExpectServerHello,
+            ..Default::default()
+        });
+        let mut scratch = vec![0u8; 64 * 1024];
+        let mut out = Vec::new();
+        let mut batch_epochs = Vec::new();
+        let mut boundaries = Vec::new();
+        loop {
+            let n = s.read(&mut scratch).await.unwrap();
+            if n == 0 {
+                panic!("eof before StreamClosed");
+            }
+            d.feed(&scratch[..n]);
+            while let Some(msg) = d.try_next().unwrap() {
+                match msg {
+                    Message::ServerHello(h) => {
+                        assert_eq!(h.status, HandshakeStatus::Ok);
+                        assert_eq!(h.chosen_mode, Some(ChosenMode::PlainBatch));
+                    }
+                    Message::PlainBatch(BatchPayload { epoch, records, .. }) => {
+                        batch_epochs.push(epoch);
+                        out.extend(records);
+                    }
+                    Message::EpochBoundary {
+                        completed_epoch,
+                        records_in_epoch,
+                    } => {
+                        boundaries.push((completed_epoch, records_in_epoch));
+                    }
+                    Message::StreamClosed {
+                        total_records,
+                        epochs_completed,
+                    } => {
+                        return (
+                            out,
+                            boundaries,
+                            (total_records, epochs_completed),
+                            batch_epochs,
+                        );
+                    }
+                    Message::StreamError {
+                        code,
+                        fatal,
+                        detail,
+                    } => {
+                        panic!(
+                            "server StreamError {code:?} fatal={fatal} detail={}",
+                            String::from_utf8_lossy(&detail)
+                        );
+                    }
+                    other => panic!("unexpected server message {other:?}"),
+                }
+            }
+        }
+    })
+}
+
 #[test]
 fn wire_roundtrip_plain_batch_with_none_shuffle() {
     let tmp = tempfile::tempdir().unwrap();
@@ -235,6 +312,28 @@ fn wire_sample_caps_record_count() {
         AuthKind::None,
     );
     assert_eq!(got.len(), 17);
+}
+
+#[test]
+fn wire_epochs_emit_boundaries_and_close_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("c.jsonl");
+    std::fs::write(&ds, "a\nb\nc\n").unwrap();
+    let g = spawn_wire_server(&[("corpus", &ds)], &[]);
+
+    let (got, boundaries, closed, batch_epochs) = fetch_records_with_meta(
+        g.port,
+        r#"{"dataset_id":"corpus","seed":0,"shuffle":"none","epochs":2,"max_batch_records":2}"#,
+    );
+    let got_str: Vec<String> = got
+        .into_iter()
+        .map(|r| String::from_utf8(r).unwrap())
+        .collect();
+    assert_eq!(got_str, vec!["a", "b", "c", "a", "b", "c"]);
+    assert_eq!(boundaries, vec![(0, 3), (1, 3)]);
+    assert_eq!(closed, (6, 2));
+    assert!(batch_epochs.contains(&0), "batch epochs: {batch_epochs:?}");
+    assert!(batch_epochs.contains(&1), "batch epochs: {batch_epochs:?}");
 }
 
 #[test]

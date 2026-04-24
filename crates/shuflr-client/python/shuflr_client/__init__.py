@@ -1,9 +1,9 @@
 """
 shuflr-client — Python client for the `shuflr serve` HTTP / wire transports.
 
-PR-34a: HTTP only. `shuflr://` / `shuflrs://` / `shuflr+unix://` schemes are
-parsed for forward compatibility but raise `NotImplementedError` at open
-time; use `http(s)://` URLs.
+Supports HTTP(S) and plain `shuflr://` wire URLs. `shuflrs://` and
+`shuflr+unix://` are parsed for forward compatibility but raise
+`NotImplementedError` at open time.
 
 Typical use:
 
@@ -46,6 +46,8 @@ class Dataset:
         is the PR-34a form. ``shuflr(s)://`` will work in PR-36.
     seed : int, optional
         Reproducibility seed passed to the server (default 0).
+    epochs : int, optional
+        Number of passes over the dataset. ``0`` means infinite.
     shuffle : str, optional
         Shuffle mode. One of ``none``, ``buffer``, ``chunk-shuffled``,
         ``index-perm``, ``reservoir``. Default ``chunk-shuffled``.
@@ -53,6 +55,11 @@ class Dataset:
         Stop after this many records.
     rank, world_size : int, optional
         Distributed partition. Both must be set together.
+    auth_token : str, optional
+        Bearer token sent to auth-protected HTTP and wire servers.
+    tls_ca_cert : str, optional
+        PEM certificate bundle used to trust HTTPS servers with a
+        private CA or self-signed certificate.
     timeout : float, optional
         Handshake timeout in seconds. Default 30.
     """
@@ -62,19 +69,25 @@ class Dataset:
         url: str,
         *,
         seed: int = 0,
+        epochs: int = 1,
         shuffle: str = "chunk-shuffled",
         sample: Optional[int] = None,
         rank: Optional[int] = None,
         world_size: Optional[int] = None,
+        auth_token: Optional[str] = None,
+        tls_ca_cert: Optional[str] = None,
         timeout: float = 30.0,
     ) -> None:
         self._native = _NativeDataset(
             url,
             seed=seed,
+            epochs=epochs,
             shuffle=shuffle,
             sample=sample,
             rank=rank,
             world_size=world_size,
+            auth_token=auth_token,
+            tls_ca_cert=tls_ca_cert,
             timeout=timeout,
         )
 

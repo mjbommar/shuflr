@@ -27,6 +27,89 @@ HERE = Path(__file__).resolve().parent
 # override with $SHUFLR_BIN.
 WORKSPACE = HERE.parents[2]
 
+TEST_TLS_CA = """-----BEGIN CERTIFICATE-----
+MIIDIzCCAgugAwIBAgIUNMrG6JoZiwm20ubiX7LQJIFXSpQwDQYJKoZIhvcNAQEL
+BQAwGTEXMBUGA1UEAwwOc2h1ZmxyLXRlc3QtY2EwHhcNMjYwNDI0MDExOTMzWhcN
+MzYwNDIxMDExOTMzWjAZMRcwFQYDVQQDDA5zaHVmbHItdGVzdC1jYTCCASIwDQYJ
+KoZIhvcNAQEBBQADggEPADCCAQoCggEBAMl0E95WnYouI17R4Aa76rYk7e1hraz5
+tSKkVADhQRftlIkSx6tHE2s3OZGIeH0xGqUnnOxUD992jPKIZL8G+/y7RFpiRv1S
+kcymjLNnNiX6TZwhfzMe8AJcfI5jWCafBDWv5fh0FM8CRUnvxJ3AMIiewZipdoUk
+GofdrIYIruOLosbbXh/bn7OvqpXN7WX9HaUdan/Tv6/sE9ZdQeMj5zkIW196AruX
+ngyhOVvBnPT2Eet+IuPvJlIPIFGLXI1mnUjVCLpHrSHarOyp1PJ7M6L6MmlfdKFx
+KVvSK/LMnDwh3eGr4N6QNMj5v8UJzxIdUZbdDlbvsMoTnjyPfVFrdrkCAwEAAaNj
+MGEwHQYDVR0OBBYEFHugwqAC4KBa8Fub2876AknkG3+bMB8GA1UdIwQYMBaAFHug
+wqAC4KBa8Fub2876AknkG3+bMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQD
+AgEGMA0GCSqGSIb3DQEBCwUAA4IBAQAjEZhOltG7hG4lrHFCExoljNeesvVjlO6x
+3ee4Syz5rlaFbsCVseHRZgP/b1BHix1ZbfpnLyVZQe/+j+qTcBBbr5aUepHw8iOd
+ARcVGRdxSSbWXiiW9JZl1VfsWAUBUO3aSakkHlxYxJsN4lXAOTGReHnU4CQnnW9u
+Iu435wlVW83HEwHlIlDLX+at6NxTmeD4d86qCddyWY+vddwz75C4ZfrDxTXtBAfm
+rpwFbdmVzRYKojz8M3jT93QYdvK3A5UVERQ5eMbJtPcbFn+JMbolH0QwsKG7xAw3
+1skYVikvaZwNGH86Ju3h5UaNxctER5pAmGI9Xiq0aIqzMBxrUwFO
+-----END CERTIFICATE-----
+"""
+
+TEST_TLS_CERT = """-----BEGIN CERTIFICATE-----
+MIIDTjCCAjagAwIBAgIUZfo147MuF+0xvY3mtuFxgmdM49QwDQYJKoZIhvcNAQEL
+BQAwGTEXMBUGA1UEAwwOc2h1ZmxyLXRlc3QtY2EwHhcNMjYwNDI0MDExOTMzWhcN
+MzYwNDIxMDExOTMzWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwggEiMA0GCSqGSIb3
+DQEBAQUAA4IBDwAwggEKAoIBAQDGRsgmivYErWiNudwBR1i5931ZBgWgyZcsxpg3
+uingOBazRmcLxaRJyuARCjmodKyv4RlH97Bc1jcoSNA2wyQ7jpeBtQyZWKk+ITcy
+L26uYf5iF9oEdVjBJwL/jowAXEC9DSMnS33INqefStuzYbwBq6xdEgfK1GG7r02F
+VKU1S5Ao5C+V14XRpxDfcKXyhXnOFAgQ8mQBwQwtI0uFGePWFl+9QyJ3AdPSYa3s
+m6IPRm9UY7P1jAI/DJ1bYT7kCFsKqsfJq45ciroUoyT9JSw+Vbny+g9WdHf/D8jn
+WfnWR5t3eb+sPHMHcbSSSEJcEUh9u5x8JBSZLva08+6YE9RJAgMBAAGjgZIwgY8w
+DAYDVR0TAQH/BAIwADAOBgNVHQ8BAf8EBAMCBaAwEwYDVR0lBAwwCgYIKwYBBQUH
+AwEwGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMB0GA1UdDgQWBBQKcm3QIfNN
+10Wy+85ysCxrJ0N6PjAfBgNVHSMEGDAWgBR7oMKgAuCgWvBbm9vO+gJJ5Bt/mzAN
+BgkqhkiG9w0BAQsFAAOCAQEAm5BP9+IxSneE8XMRcthGO+N3sKDkzW6/cFRJPC/E
+97FLWVE5dY1NyaPZLJnCkBIRqTgkoSVXp016/t5BqqzJayIZVkfSh3HHYGnS1TDt
+S1JLKIH7hzBURlRtwE561mfJ3nI9jNxxccM0oC4FIb5WkezowyqCc987CBTr6TnF
+6+XcjcMAoKyOLijOU5BFqUV3ILj/rhDC3qyxv77XgqIq0P0KxEtIc65wuejcVDK8
+QIiJwuVjX+WMbLKt8miGsaeJNKNFxEyN0K7G+tSb1MrsD2RrnCLek9v8HEfUw1SH
+wUCLAWVbmQ6fMn2ouUGdwrfnj93CVL0H4VcFPOYn3jrdYw==
+-----END CERTIFICATE-----
+"""
+
+TEST_TLS_KEY = """-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDGRsgmivYErWiN
+udwBR1i5931ZBgWgyZcsxpg3uingOBazRmcLxaRJyuARCjmodKyv4RlH97Bc1jco
+SNA2wyQ7jpeBtQyZWKk+ITcyL26uYf5iF9oEdVjBJwL/jowAXEC9DSMnS33INqef
+StuzYbwBq6xdEgfK1GG7r02FVKU1S5Ao5C+V14XRpxDfcKXyhXnOFAgQ8mQBwQwt
+I0uFGePWFl+9QyJ3AdPSYa3sm6IPRm9UY7P1jAI/DJ1bYT7kCFsKqsfJq45ciroU
+oyT9JSw+Vbny+g9WdHf/D8jnWfnWR5t3eb+sPHMHcbSSSEJcEUh9u5x8JBSZLva0
+8+6YE9RJAgMBAAECggEAJLIscG+3BRoX9+T+WhE7k12B6jRCXeX5b+zIdsXiYrBW
+yTK+NxBK7epZimXPUoVXgYyiWm61yhTObAr/2CbJIamsEjIxJP9jAU/x8HyVWjpi
+M4LxE3KpbMQc2rHl6NoqFCMmjqr62k99Oe7Hlx0/R7rfYXFJFmm0teEFsqe+FMz2
+MfGSKjbzYQltthSCByAecwmpg6BNKw9U6l55hpYg1ZArwWebGAxmfntpbNISO29w
+HlmybFtCvujOwC4fFfFUFFWXXtXOM+n1ubL6M+PCDWrFAvB5BIO8qKDfSqqZz2fn
+d3eMTCx3Cl557GhHP3kkiPg9OuCEiUbuNJvSBYUgRQKBgQDnjltLxxLOLf9R4vHN
+8F0VJEPsVunvtLTcwJK6mUCoB+8hU/OW4Y3UX4VCLWsuAfWXL+7LTgeR5YX9wueo
+wOHGNgVtyp5+DudBi3uX1JwT9qZfM2THVFWfHGLyXhtB2lcvKdp/yobgRdqv1P5s
+wRdFJ5tddKisFNXaQZP22LV99QKBgQDbNRE4yPThF3vZ0omS655mjIwOYbFFDYYY
+E5xJlOo7HCqPrwg0/OYnb71D3g6PrfyoFqhBAhxpFe1wHNVZimXXQ320cpeWPMLI
+sA8jnCpkt4zxUcjlnMObidWEKfFvLG5StFAiJNeImOBGzGKwT6ANxV6zLwTY3QEr
+BgeGjIFUhQKBgBh3rWPzdCQ/LgRsE5rsNBnAzECT6oI+uQG+g4KeIPvgYr9FzK57
+xO3U7hLRE8s3v8iq8vOemiQreZ4X0zy8rN6x5J72UwsE7iC56WRgveFKJchXeOWr
+HqUCbd4oXX724FGGfaUVNG1MVFBSFFRPjvLqvXsBkbUlOnemiEkEGyFlAoGBAMCe
+nQd87lFsxVPegS0tBf+uuNNaXN8ExzQY51hxFnHiijO/5kJJiCRXN8SPN9RhWoaJ
+gke9hyGANygw7fjEeEDz+V265CEMO00GCAeOjmH6OEtFRncdjXT7ZTfBc3nxXPAn
+qdKW9R3+1/TeXEn5bfcr288wHd5CNWiM38gHZw3RAoGBAMJ/N1Inf5g/pyEK4bmG
+ZZ+2ZEgs2b7Vxp6kHzBpU/TTj7Ip/SkJPPPXHJWRID3VGdbhR6ykT10rpuoSdO+E
+RON9SGU501fQ1znYDjfXWqjBabAJr/6osY3hjC/eMe74ZHUBwABG7T7dHPbGi9Ct
+YSALHKYajrsQqgvQKFb0/4VI
+-----END PRIVATE KEY-----
+"""
+
+
+def _write_test_tls_files(tmp_path: Path) -> tuple[Path, Path, Path]:
+    ca = tmp_path / "test-ca.pem"
+    cert = tmp_path / "localhost-cert.pem"
+    key = tmp_path / "localhost-key.pem"
+    ca.write_text(TEST_TLS_CA)
+    cert.write_text(TEST_TLS_CERT)
+    key.write_text(TEST_TLS_KEY)
+    return ca, cert, key
+
 
 def _find_shuflr_bin() -> Path:
     env = os.environ.get("SHUFLR_BIN")
@@ -176,6 +259,36 @@ def test_dataset_respects_sample(serve_factory, tmp_path):
     assert len(out) == 13
 
 
+def test_dataset_respects_epochs(serve_factory, tmp_path):
+    ds_path = tmp_path / "c.jsonl"
+    ds_path.write_text("a\nb\nc\n")
+    server = serve_factory({"c": ds_path})
+
+    ds = shuflr_client.Dataset(
+        f"{server['base']}/v1/streams/c",
+        shuffle="none",
+        epochs=2,
+    )
+    assert list(ds) == [b"a", b"b", b"c", b"a", b"b", b"c"]
+
+
+def test_https_dataset_connects_with_custom_ca(serve_factory, tmp_path):
+    ds_path = tmp_path / "c.jsonl"
+    ds_path.write_text("secure\n")
+    ca, cert, key = _write_test_tls_files(tmp_path)
+    server = serve_factory(
+        {"c": ds_path},
+        extra=["--tls-cert", str(cert), "--tls-key", str(key)],
+    )
+
+    ds = shuflr_client.Dataset(
+        f"https://localhost:{server['port']}/v1/streams/c",
+        shuffle="none",
+        tls_ca_cert=str(ca),
+    )
+    assert list(ds) == [b"secure"]
+
+
 def test_transport_property():
     ds = shuflr_client.Dataset("http://x:9000/v1/streams/foo")
     assert ds.transport == "http"
@@ -273,6 +386,24 @@ def test_bearer_token_missing_raises(serve_factory, tmp_path):
             proc.wait()
 
 
+def test_http_bearer_token_authenticates(serve_factory, tmp_path):
+    ds_path = tmp_path / "c.jsonl"
+    ds_path.write_text("x\n")
+    tokens = tmp_path / "tok.txt"
+    tokens.write_text("realtoken\n")
+    server = serve_factory(
+        {"c": ds_path},
+        extra=["--auth", "bearer", "--auth-tokens", str(tokens)],
+    )
+
+    ds = shuflr_client.Dataset(
+        f"{server['base']}/v1/streams/c",
+        shuffle="none",
+        auth_token="realtoken",
+    )
+    assert list(ds) == [b"x"]
+
+
 # ---------------- shuflr-wire/1 (PR-34b) ----------------
 
 
@@ -307,6 +438,38 @@ def test_wire_dataset_respects_sample(serve_factory, tmp_path):
     )
     got = list(ds)
     assert len(got) == 23
+
+
+def test_wire_dataset_respects_epochs(serve_factory, tmp_path):
+    ds_path = tmp_path / "c.jsonl"
+    ds_path.write_text("a\nb\nc\n")
+    server = serve_factory({"c": ds_path}, transport="wire")
+
+    ds = shuflr_client.Dataset(
+        f"{server['base']}/c",
+        shuffle="none",
+        epochs=2,
+    )
+    assert list(ds) == [b"a", b"b", b"c", b"a", b"b", b"c"]
+
+
+def test_wire_bearer_token_authenticates(serve_factory, tmp_path):
+    ds_path = tmp_path / "c.jsonl"
+    ds_path.write_text("x\n")
+    tokens = tmp_path / "tok.txt"
+    tokens.write_text("realtoken\n")
+    server = serve_factory(
+        {"c": ds_path},
+        transport="wire",
+        extra=["--auth", "bearer", "--auth-tokens", str(tokens)],
+    )
+
+    ds = shuflr_client.Dataset(
+        f"{server['base']}/c",
+        shuffle="none",
+        auth_token="realtoken",
+    )
+    assert list(ds) == [b"x"]
 
 
 def test_wire_rejects_unknown_dataset(serve_factory, tmp_path):

@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "shuflr-client"
 version = "0.0.0"
-description = "Python client for shuflr — HTTP NDJSON and (coming) shuflr-wire/1 binary transports"
+description = "Python client for shuflr — HTTP NDJSON and shuflr-wire/1 binary transports"
 readme = "README.md"
 license = { text = "MIT OR Apache-2.0" }
 authors = [{ name = "Michael Bommarito", email = "michael.bommarito@gmail.com" }]

@@ -2,8 +2,8 @@
 //!
 //! Dispatch for every non-`serve` subcommand lives here: `stream` (with
 //! all five shuffle modes), `convert`, `info`, `analyze`, `index`,
-//! `verify`, `completions`, and `man`. `serve` is designed in
-//! `docs/design/005-serve-multi-transport.md` and not yet wired.
+//! `verify`, `completions`, and `man`. `serve` is feature-gated and
+//! lives in this module's lower section.
 //!
 //! Each public fn here takes its subcommand's clap-derived args struct
 //! and returns an `exit::Code`. The implementation modules (`shuflr::

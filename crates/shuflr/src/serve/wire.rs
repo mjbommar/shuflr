@@ -387,10 +387,10 @@ where
     // (~6× smaller than NDJSON on EDGAR-like corpora).
     #[cfg(feature = "zstd")]
     if chosen_mode == ChosenMode::RawFrame {
-        let raw_result = stream_raw_frames(
+        let raw_result = stream_raw_frame_epochs(
             &entry.path,
             open.seed,
-            0, // epoch — PR-33 only supports single-epoch runs
+            open.epochs.unwrap_or(1),
             open.sample,
             &mut wr,
             &mut tx_buf,
@@ -410,20 +410,133 @@ where
         _ => None,
     };
 
+    let plain_result = stream_plain_batch_epochs(
+        &path,
+        &open.shuffle,
+        open.seed,
+        open.epochs.unwrap_or(1),
+        open.sample,
+        partition,
+        batch_records,
+        &mut wr,
+        &mut tx_buf,
+        &mut rd,
+        &mut scratch,
+        &mut decoder,
+    )
+    .await;
+    finish_stream(plain_result, &mut wr, &mut tx_buf).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_plain_batch_epochs<W, R>(
+    path: &std::path::Path,
+    shuffle: &str,
+    seed: u64,
+    epochs: u32,
+    sample: Option<u64>,
+    partition: Option<(u32, u32)>,
+    batch_records: u32,
+    wr: &mut W,
+    tx_buf: &mut Vec<u8>,
+    rd: &mut R,
+    scratch: &mut [u8],
+    decoder: &mut Decoder,
+) -> Result<(u64, u32)>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut batch_id: u64 = 0;
+    let mut total_records: u64 = 0;
+    let mut epochs_completed: u32 = 0;
+    let mut epoch = 0u64;
+
+    loop {
+        if epochs != 0 && epoch >= u64::from(epochs) {
+            break;
+        }
+        let epoch_u32 =
+            u32::try_from(epoch).map_err(|_| Error::Input(format!("epoch {epoch} exceeds u32")))?;
+        let epoch_outcome = stream_plain_batch_epoch(
+            path,
+            shuffle,
+            seed,
+            epoch,
+            sample,
+            partition,
+            batch_records,
+            epoch_u32,
+            &mut batch_id,
+            wr,
+            tx_buf,
+            rd,
+            scratch,
+            decoder,
+        )
+        .await?;
+        let records_in_epoch = match epoch_outcome {
+            PlainEpochOutcome::Completed(n) => n,
+            PlainEpochOutcome::Cancelled(n) => {
+                total_records += n;
+                return Ok((total_records, epochs_completed));
+            }
+        };
+        total_records += records_in_epoch;
+        epochs_completed = epochs_completed.saturating_add(1);
+        send_epoch_boundary(wr, tx_buf, epoch_u32, records_in_epoch).await?;
+        epoch += 1;
+    }
+
+    Ok((total_records, epochs_completed))
+}
+
+enum PlainEpochOutcome {
+    Completed(u64),
+    Cancelled(u64),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_plain_batch_epoch<W, R>(
+    path: &std::path::Path,
+    shuffle: &str,
+    seed: u64,
+    epoch: u64,
+    sample: Option<u64>,
+    partition: Option<(u32, u32)>,
+    batch_records: u32,
+    epoch_u32: u32,
+    batch_id: &mut u64,
+    wr: &mut W,
+    tx_buf: &mut Vec<u8>,
+    rd: &mut R,
+    scratch: &mut [u8],
+    decoder: &mut Decoder,
+) -> Result<PlainEpochOutcome>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
+{
     // The pipeline task pushes completed records into a bounded
     // channel. The main async task buckets them into PlainBatch frames
     // and writes. On error the pipeline emits StreamError and closes.
     let (record_tx, mut record_rx) = mpsc::channel::<Vec<u8>>(batch_records as usize * 4);
-    let shuffle_name = open.shuffle.clone();
-    let seed = open.seed;
-    let sample = open.sample;
+    let path = path.to_path_buf();
+    let shuffle_name = shuffle.to_string();
     let blocking = tokio::task::spawn_blocking(move || {
-        run_pipeline_into_channel(&path, &shuffle_name, seed, sample, partition, record_tx)
+        run_pipeline_into_channel(
+            &path,
+            &shuffle_name,
+            seed,
+            epoch,
+            sample,
+            partition,
+            record_tx,
+        )
     });
 
-    let mut batch_id: u64 = 0;
     let mut pending: Vec<Vec<u8>> = Vec::with_capacity(batch_records as usize);
-    let mut total_records: u64 = 0;
+    let mut records_in_epoch: u64 = 0;
 
     loop {
         tokio::select! {
@@ -432,14 +545,14 @@ where
                     Some(rec) => {
                         pending.push(rec);
                         if pending.len() as u32 >= batch_records {
-                            flush_batch(&mut wr, &mut tx_buf, &mut batch_id, &mut pending, 0).await?;
+                            flush_batch(wr, tx_buf, batch_id, &mut pending, epoch_u32).await?;
                         }
-                        total_records += 1;
+                        records_in_epoch += 1;
                     }
                     None => {
-                        // pipeline finished (or errored; check handle below)
+                        // Pipeline finished (or errored; check handle below).
                         if !pending.is_empty() {
-                            flush_batch(&mut wr, &mut tx_buf, &mut batch_id, &mut pending, 0).await?;
+                            flush_batch(wr, tx_buf, batch_id, &mut pending, epoch_u32).await?;
                         }
                         break;
                     }
@@ -448,19 +561,19 @@ where
             // Concurrent read: watch for Cancel; tolerate EOF without
             // erroring (client closed writer half after signalling
             // done).
-            n = rd.read(&mut scratch) => {
+            n = rd.read(scratch) => {
                 match n {
                     Ok(0) => {
                         // Drain any remaining records then close.
                         while let Some(rec) = record_rx.recv().await {
                             pending.push(rec);
                             if pending.len() as u32 >= batch_records {
-                                flush_batch(&mut wr, &mut tx_buf, &mut batch_id, &mut pending, 0).await?;
+                                flush_batch(wr, tx_buf, batch_id, &mut pending, epoch_u32).await?;
                             }
-                            total_records += 1;
+                            records_in_epoch += 1;
                         }
                         if !pending.is_empty() {
-                            flush_batch(&mut wr, &mut tx_buf, &mut batch_id, &mut pending, 0).await?;
+                            flush_batch(wr, tx_buf, batch_id, &mut pending, epoch_u32).await?;
                         }
                         break;
                     }
@@ -470,13 +583,18 @@ where
                             match msg {
                                 Message::Cancel { .. } => {
                                     tracing::debug!("wire: client Cancel");
-                                    return Ok(());
+                                    return Ok(PlainEpochOutcome::Cancelled(records_in_epoch));
                                 }
                                 Message::AddCredit { .. } | Message::Pong { .. } => {
                                     // PR-33a will act on AddCredit; PR-36 on Pong.
                                 }
                                 other => {
-                                    return handshake_error(&mut wr, &mut tx_buf, format!("unexpected client message {:?} after handshake", other.kind())).await;
+                                    let detail = format!(
+                                        "unexpected client message {:?} after handshake",
+                                        other.kind()
+                                    );
+                                    let _ = handshake_error(wr, tx_buf, detail.clone()).await;
+                                    return Err(Error::Input(detail));
                                 }
                             }
                         }
@@ -487,45 +605,14 @@ where
         }
     }
 
-    // ---- Phase 7: reap the blocking task.
     match blocking.await {
-        Ok(Ok(())) => {
-            let epoch_msg = Message::EpochBoundary {
-                completed_epoch: 0,
-                records_in_epoch: total_records,
-            };
-            tx_buf.clear();
-            encode_into(&epoch_msg, &mut tx_buf);
-            wr.write_all(&tx_buf).await.map_err(Error::Io)?;
-
-            let closed = Message::StreamClosed {
-                total_records,
-                epochs_completed: 1,
-            };
-            tx_buf.clear();
-            encode_into(&closed, &mut tx_buf);
-            wr.write_all(&tx_buf).await.map_err(Error::Io)?;
-            wr.flush().await.map_err(Error::Io)?;
-        }
-        Ok(Err(e)) => {
-            let err_msg = Message::StreamError {
-                code: StreamErrorCode::Internal,
-                fatal: true,
-                detail: e.to_string().into_bytes(),
-            };
-            tx_buf.clear();
-            encode_into(&err_msg, &mut tx_buf);
-            let _ = wr.write_all(&tx_buf).await;
-            let _ = wr.flush().await;
-            return Err(e);
-        }
+        Ok(Ok(())) => Ok(PlainEpochOutcome::Completed(records_in_epoch)),
+        Ok(Err(e)) => Err(e),
         Err(join_err) => {
             tracing::warn!(err = %join_err, "wire: pipeline task panicked");
-            return Err(Error::Input(format!("pipeline panic: {join_err}")));
+            Err(Error::Input(format!("pipeline panic: {join_err}")))
         }
     }
-
-    Ok(())
 }
 
 /// Flush the pending record list as a PlainBatch frame.
@@ -551,12 +638,69 @@ where
     Ok(())
 }
 
+async fn send_epoch_boundary<W>(
+    wr: &mut W,
+    tx_buf: &mut Vec<u8>,
+    completed_epoch: u32,
+    records_in_epoch: u64,
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let epoch_msg = Message::EpochBoundary {
+        completed_epoch,
+        records_in_epoch,
+    };
+    tx_buf.clear();
+    encode_into(&epoch_msg, tx_buf);
+    wr.write_all(tx_buf).await.map_err(Error::Io)?;
+    Ok(())
+}
+
 /// Raw-frame streamer (005 §3.5). For each frame in the permuted
 /// order, pread the compressed bytes and ship them wholesale with
 /// the 32-byte per-frame ChaCha20 seed. Server CPU drops to
 /// `pread + send`; the client pays the decompress + Fisher-Yates.
-///
-/// Returns `Ok(total_records, epochs_completed)` on success.
+#[cfg(feature = "zstd")]
+#[allow(clippy::too_many_arguments)]
+async fn stream_raw_frame_epochs<W, R>(
+    path: &std::path::Path,
+    seed: u64,
+    epochs: u32,
+    sample: Option<u64>,
+    wr: &mut W,
+    tx_buf: &mut Vec<u8>,
+    rd: &mut R,
+    scratch: &mut [u8],
+    decoder: &mut Decoder,
+) -> Result<(u64, u32)>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut total_records: u64 = 0;
+    let mut epochs_completed: u32 = 0;
+    let mut epoch = 0u64;
+
+    loop {
+        if epochs != 0 && epoch >= u64::from(epochs) {
+            break;
+        }
+        let epoch_u32 =
+            u32::try_from(epoch).map_err(|_| Error::Input(format!("epoch {epoch} exceeds u32")))?;
+        let records_in_epoch = stream_raw_frames(
+            path, seed, epoch_u32, sample, wr, tx_buf, rd, scratch, decoder,
+        )
+        .await?;
+        total_records += records_in_epoch;
+        epochs_completed = epochs_completed.saturating_add(1);
+        send_epoch_boundary(wr, tx_buf, epoch_u32, records_in_epoch).await?;
+        epoch += 1;
+    }
+
+    Ok((total_records, epochs_completed))
+}
+
 #[cfg(feature = "zstd")]
 #[allow(clippy::too_many_arguments)]
 async fn stream_raw_frames<W, R>(
@@ -569,7 +713,7 @@ async fn stream_raw_frames<W, R>(
     rd: &mut R,
     scratch: &mut [u8],
     decoder: &mut Decoder,
-) -> Result<(u64, u32)>
+) -> Result<u64>
 where
     W: tokio::io::AsyncWrite + Unpin,
     R: tokio::io::AsyncRead + Unpin,
@@ -676,7 +820,7 @@ where
     }
     wr.flush().await.map_err(Error::Io)?;
 
-    Ok((total_records, 1))
+    Ok(total_records)
 }
 
 /// Try to decode already-available client control messages without
@@ -706,8 +850,8 @@ where
     Ok(())
 }
 
-/// Send EpochBoundary + StreamClosed (or StreamError on failure).
-#[cfg(feature = "zstd")]
+/// Send StreamClosed (or StreamError on failure). EpochBoundary frames
+/// are emitted as each epoch finishes.
 async fn finish_stream<W>(
     result: Result<(u64, u32)>,
     wr: &mut W,
@@ -718,14 +862,6 @@ where
 {
     match result {
         Ok((total_records, epochs_completed)) => {
-            let epoch_msg = Message::EpochBoundary {
-                completed_epoch: 0,
-                records_in_epoch: total_records,
-            };
-            tx_buf.clear();
-            encode_into(&epoch_msg, tx_buf);
-            wr.write_all(tx_buf).await.map_err(Error::Io)?;
-
             let closed = Message::StreamClosed {
                 total_records,
                 epochs_completed,
@@ -813,6 +949,7 @@ fn run_pipeline_into_channel(
     path: &std::path::Path,
     shuffle: &str,
     seed: u64,
+    epoch: u64,
     sample: Option<u64>,
     partition: Option<(u32, u32)>,
     tx: mpsc::Sender<Vec<u8>>,
@@ -837,7 +974,7 @@ fn run_pipeline_into_channel(
             let input = crate::io::Input::open(path)?;
             let cfg = crate::pipeline::BufferConfig {
                 buffer_size: 100_000,
-                seed,
+                seed: epoch_seed(seed, epoch),
                 max_line: 16 * 1024 * 1024,
                 on_error: OnError::Skip,
                 sample,
@@ -850,7 +987,7 @@ fn run_pipeline_into_channel(
             let input = crate::io::Input::open(path)?;
             let cfg = crate::pipeline::ReservoirConfig {
                 k: 10_000,
-                seed,
+                seed: epoch_seed(seed, epoch),
                 max_line: 16 * 1024 * 1024,
                 on_error: OnError::Skip,
                 ensure_trailing_newline: true,
@@ -863,7 +1000,7 @@ fn run_pipeline_into_channel(
             let reader = crate::io::zstd_seekable::SeekableReader::open(path)?;
             let cfg = crate::pipeline::ChunkShuffledConfig {
                 seed,
-                epoch: 0,
+                epoch,
                 max_line: 16 * 1024 * 1024,
                 on_error: OnError::Skip,
                 sample,
@@ -878,7 +1015,7 @@ fn run_pipeline_into_channel(
         "index-perm" => {
             let cfg = crate::pipeline::IndexPermZstdConfig {
                 seed,
-                epoch: 0,
+                epoch,
                 sample,
                 ensure_trailing_newline: true,
                 cache_capacity: crate::pipeline::index_perm_zstd::DEFAULT_CACHE_CAPACITY,
@@ -946,6 +1083,16 @@ impl std::io::Write for RecordSink {
 
 fn memchr_pos(haystack: &[u8]) -> Option<usize> {
     memchr::memchr(b'\n', haystack)
+}
+
+fn epoch_seed(seed: u64, epoch: u64) -> u64 {
+    if epoch == 0 {
+        return seed;
+    }
+    let key = crate::seed::Seed::new(seed).epoch(epoch);
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&key[..8]);
+    u64::from_le_bytes(bytes)
 }
 
 #[cfg(test)]

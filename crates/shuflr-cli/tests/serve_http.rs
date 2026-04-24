@@ -187,6 +187,22 @@ fn stream_sample_caps_records() {
 }
 
 #[test]
+fn stream_epochs_replays_records() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ds = tmp.path().join("s.jsonl");
+    std::fs::write(&ds, "a\nb\nc\n").unwrap();
+
+    let g = spawn_serve(&[("c", &ds)]);
+
+    let resp = ureq::get(&format!("{}/v1/streams/c?shuffle=none&epochs=2", g.base()))
+        .call()
+        .unwrap();
+    let body = resp.into_string().unwrap();
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(lines, vec!["a", "b", "c", "a", "b", "c"]);
+}
+
+#[test]
 fn unknown_dataset_returns_404_json() {
     let tmp = tempfile::tempdir().unwrap();
     let ds = tmp.path().join("x.jsonl");
