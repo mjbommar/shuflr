@@ -14,3 +14,6 @@ crates/shuflr-client/dist/
 # maturin develop drops the compiled extension into the source tree
 crates/shuflr-client/python/shuflr_client/_shuflr_client_native*.so
 crates/shuflr-client/python/shuflr_client/_shuflr_client_native*.pyd
+
+# Python build artifact from maturin/uv invocations
+crates/shuflr-client/uv.lock
