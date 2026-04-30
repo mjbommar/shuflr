@@ -86,29 +86,18 @@ jobs:
           path: crates/shuflr-client/dist/*.whl
           if-no-files-found: error
 
-  build-sdist:
-    name: sdist
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-      - name: Build sdist
-        uses: PyO3/maturin-action@v1
-        with:
-          working-directory: crates/shuflr-client
-          command: sdist
-          args: --out dist
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sdist
-          path: crates/shuflr-client/dist/*.tar.gz
-          if-no-files-found: error
+  # NOTE: sdist intentionally omitted for v0.1.0. maturin builds the
+  # sdist from the workspace root, which lays the package out as
+  # `shuflr_client-0.1.0/crates/shuflr-client/LICENSE-MIT` — but the
+  # PKG-INFO declares `License-File: LICENSE-MIT` (top-level), so
+  # PyPI's PEP 639 enforcement rejects it with 400. Wheels cover
+  # all 4 supported platforms (linux x64 + aarch64, macos arm64,
+  # windows x64); users on other platforms can build from git
+  # until we find a workspace-friendly sdist layout.
 
   publish-pypi:
     name: publish to PyPI
-    needs: [build-wheels, build-sdist]
+    needs: [build-wheels]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     environment:
@@ -143,7 +132,7 @@ jobs:
 
   publish-testpypi:
     name: publish to TestPyPI
-    needs: [build-wheels, build-sdist]
+    needs: [build-wheels]
     if: github.event_name == 'workflow_dispatch' && !inputs.dry_run
     runs-on: ubuntu-latest
     environment:
