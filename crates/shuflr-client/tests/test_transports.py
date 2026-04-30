@@ -528,6 +528,31 @@ def test_wire_raw_frame_preserves_multiset(serve_factory, tmp_path):
     assert got != records
 
 
+def test_wire_raw_frame_respects_sample(serve_factory, tmp_path):
+    """sample=N must hold on the wire raw-frame path. The server
+    trims at frame boundaries so it can ship a whole 800-record
+    frame even when the user asked for 5; the client has to enforce
+    the cap to honor the API contract. Regression for the 0.1.0
+    behavior where the iterator over-emitted on chunk-shuffled +
+    wire."""
+    plain = tmp_path / "c.jsonl"
+    seekable = tmp_path / "c.jsonl.zst"
+    records = [f'{{"i":{i:04d}}}' for i in range(800)]
+    plain.write_text("\n".join(records) + "\n")
+    _convert_to_zstd(plain, seekable)
+    server = serve_factory({"corpus": seekable}, transport="wire")
+
+    for n in (1, 5, 17, 200):
+        ds = shuflr_client.Dataset(
+            f"{server['base']}/corpus",
+            seed=42,
+            shuffle="chunk-shuffled",
+            sample=n,
+        )
+        got = list(ds)
+        assert len(got) == n, f"sample={n} on wire raw-frame: got {len(got)}"
+
+
 def test_wire_raw_and_plain_multiset_match(serve_factory, tmp_path):
     """Raw-frame path (chunk-shuffled on seekable-zstd) and plain-
     batch path (shuffle=buffer) both see the same input, so their

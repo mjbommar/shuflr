@@ -295,6 +295,11 @@ struct Dataset {
     auth_token: Option<String>,
     tls_ca_cert: Option<String>,
     timeout_secs: f64,
+    // Records yielded so far. Used to enforce `sample` client-side
+    // even when the server hands us a whole raw frame at once
+    // (chunk-shuffled over shuflr-wire/1) — the server trims at
+    // frame boundaries, but the user expects exactly `sample`.
+    records_emitted: u64,
 }
 
 #[pymethods]
@@ -342,6 +347,7 @@ impl Dataset {
             auth_token,
             tls_ca_cert,
             timeout_secs: timeout,
+            records_emitted: 0,
         })
     }
 
@@ -362,6 +368,17 @@ impl Dataset {
         if slf.stream.is_none() {
             slf.open_stream()?;
         }
+        // Enforce `sample` client-side. The HTTP path also trims via
+        // `?sample=N`, but the wire raw-frame path gives the client
+        // whole compressed frames whose record count is set by the
+        // converter, not by the user. Stopping here guarantees the
+        // user-facing iterator yields exactly `sample` records on
+        // every transport.
+        if let Some(cap) = slf.sample
+            && slf.records_emitted >= cap
+        {
+            return Err(PyStopIteration::new_err(()));
+        }
         let py = slf.py();
         let rec = match &mut slf.stream {
             Some(Stream::Http(s)) => s.next_line(),
@@ -369,7 +386,10 @@ impl Dataset {
             None => None,
         };
         match rec {
-            Some(Ok(bytes)) => Ok(PyBytes::new(py, &bytes).into()),
+            Some(Ok(bytes)) => {
+                slf.records_emitted += 1;
+                Ok(PyBytes::new(py, &bytes).into())
+            }
             Some(Err(e)) => Err(e),
             None => Err(PyStopIteration::new_err(())),
         }
