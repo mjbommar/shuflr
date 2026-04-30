@@ -25,7 +25,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # pyo3 builds the Python extension module. `abi3-py39` means we ship
 # one wheel that loads on Python 3.9+ without per-version rebuilds.
-pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py39"] }
 # Blocking HTTP/1.1 client. No tokio, no async. One crate, few deps —
 # important for wheel size and for compatibility with PyTorch's
 # multiprocessing workers (no runtime to fork across).
@@ -51,5 +51,5 @@ rand_chacha = "0.3"
 
 [dev-dependencies]
 # Spawn a real server binary in integration tests.
-shuflr = { path = "../shuflr", features = ["serve"] }
+shuflr = { path = "../shuflr", version = "0.1", features = ["serve"] }
 tempfile = "3"

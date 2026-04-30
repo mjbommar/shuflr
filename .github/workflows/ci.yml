@@ -35,6 +35,12 @@ jobs:
   features:
     name: cargo hack each-feature
     runs-on: ubuntu-latest
+    # Verifies the workspace compiles for every feature combination.
+    # Per-feature warning-free is not a goal here (turn-of-feature
+    # combos legitimately leave helpers unused); the `check` job
+    # enforces -D warnings on the default + all-targets build.
+    env:
+      RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -30,15 +30,12 @@ zstd = ["shuflr/zstd"]
 gzip = ["shuflr/gzip"]
 bzip2 = ["shuflr/bzip2"]
 xz = ["shuflr/xz"]
-s3 = ["shuflr/s3"]
-gcs = ["shuflr/gcs"]
-sandbox = ["shuflr/sandbox"]
 # Parquet + HF Hub input for `shuflr convert`.
 parquet = ["shuflr/parquet"]
 # Canonical build presets. `serve` enables the HTTP transport
 # (005 §2.1). Additional transports: `grpc` adds gRPC (PR-35), etc.
 serve = ["shuflr/serve", "dep:tokio"]
-full = ["serve", "grpc", "prom", "otlp", "uring", "zstd", "gzip", "bzip2", "xz", "s3", "gcs", "sandbox", "parquet"]
+full = ["serve", "grpc", "prom", "otlp", "uring", "zstd", "gzip", "bzip2", "xz", "parquet"]
 
 [dependencies]
 shuflr = { path = "../shuflr", version = "0.1" }

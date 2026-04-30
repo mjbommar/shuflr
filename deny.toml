@@ -18,13 +18,30 @@ allow = [
     "Zlib",
     "CC0-1.0",
     "MPL-2.0",
+    # Boost — OSI-approved permissive license. Used by xxhash-rust
+    # (the xxh3 implementation behind shuflr-wire/1's frame checksums).
+    "BSL-1.0",
+    # Community Data License Agreement Permissive 2.0. Used by
+    # webpki-roots, which packages the Mozilla CA bundle for our
+    # rustls TLS stack. Permissive in spirit; safe for distribution.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.93
 
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+# Transitive unmaintained warnings flagged elsewhere in the dep
+# graph (e.g. `paste`, `number_prefix`, `rustls-pemfile`) are
+# informational, not security findings. Limit unmaintained
+# enforcement to direct workspace deps.
+unmaintained = "workspace"
+ignore = [
+    # rustls-pemfile is unmaintained as of August 2025; the
+    # migration target is `rustls-pki-types::PemObject` (same
+    # PEM parser, different API). Tracked as a follow-up.
+    "RUSTSEC-2025-0134",
+]
 
 [bans]
 multiple-versions = "warn"
