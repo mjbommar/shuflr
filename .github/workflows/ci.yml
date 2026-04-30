@@ -51,3 +51,38 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  publish-dryrun:
+    name: cargo publish --dry-run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # shuflr-wire is the leaf crate — full dry-run including build.
+      - name: shuflr-wire (full dry-run)
+        run: cargo publish --dry-run -p shuflr-wire
+      # Downstream crates depend on shuflr-wire / shuflr from crates.io.
+      # Until those are published, full dry-run can't resolve. Validate
+      # the manifest + included files instead via `cargo package --list`.
+      - name: shuflr (manifest + file list)
+        run: cargo package --list -p shuflr
+      - name: shuflr-cli (manifest + file list)
+        run: cargo package --list -p shuflr-cli
+
+  python-wheel:
+    name: maturin build (linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: crates/shuflr-client
+          target: x86_64
+          manylinux: "2_28"
+          args: --release --strip --out dist
+          sccache: "true"
+      - run: ls -lh crates/shuflr-client/dist/

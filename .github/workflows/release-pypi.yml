@@ -1,0 +1,159 @@
+name: release-pypi
+
+# Builds the shuflr-client wheel matrix (linux x86_64+aarch64, macOS
+# x86_64+arm64, windows x86_64) plus the sdist, then uploads to PyPI
+# via OIDC trusted publishing.
+#
+# Trigger:  push a tag matching `v*.*.*`. Or run manually via the
+#           Actions tab (workflow_dispatch). Manual runs upload to
+#           TestPyPI by default; flip the dry_run input for a build
+#           that does NOT upload anywhere.
+#
+# Auth:     PyPI trusted publishing — no secrets needed once configured.
+#           On PyPI: Account → Publishing → Add a new pending publisher
+#               Owner:    mjbommar
+#               Repo:     shuflr
+#               Workflow: release-pypi.yml
+#               Env:      pypi          (production)
+#               Env:      testpypi      (workflow_dispatch sandbox)
+#           Same setup on https://test.pypi.org for workflow_dispatch.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build only — do not upload to PyPI or TestPyPI"
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  build-wheels:
+    name: wheel ${{ matrix.target }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            maturin_target: x86_64
+            manylinux: "2_28"
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            maturin_target: aarch64
+            manylinux: "2_28"
+          - os: macos-13
+            target: x86_64-apple-darwin
+            maturin_target: x86_64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            maturin_target: aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            maturin_target: x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Build wheel (${{ matrix.target }})
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: crates/shuflr-client
+          target: ${{ matrix.maturin_target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          args: --release --strip --out dist
+          sccache: "true"
+
+      - name: Show built artifacts
+        shell: bash
+        run: ls -lh crates/shuflr-client/dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.target }}
+          path: crates/shuflr-client/dist/*.whl
+          if-no-files-found: error
+
+  build-sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: crates/shuflr-client
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: crates/shuflr-client/dist/*.tar.gz
+          if-no-files-found: error
+
+  publish-pypi:
+    name: publish to PyPI
+    needs: [build-wheels, build-sdist]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/shuflr-client
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List artifacts
+        run: ls -lh dist/
+      - name: Verify tag matches pyproject.toml version
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/v}"
+          PYPROJECT="$(grep -m1 -E '^version' crates/shuflr-client/pyproject.toml | cut -d'"' -f2)"
+          echo "Tag version:        $TAG"
+          echo "pyproject version:  $PYPROJECT"
+          if [ "$TAG" != "$PYPROJECT" ]; then
+            echo "::error::Tag v$TAG does not match pyproject.toml version $PYPROJECT"
+            exit 1
+          fi
+        shell: bash
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          skip-existing: false
+
+  publish-testpypi:
+    name: publish to TestPyPI
+    needs: [build-wheels, build-sdist]
+    if: github.event_name == 'workflow_dispatch' && !inputs.dry_run
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/shuflr-client
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist/
+          skip-existing: true

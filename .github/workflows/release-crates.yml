@@ -1,0 +1,105 @@
+name: release-crates
+
+# Publishes the three publishable workspace crates to crates.io in
+# dependency order: shuflr-wire → shuflr → shuflr-cli. (shuflr-client
+# is a Python wheel — see release-pypi.yml.)
+#
+# Trigger:  push a tag matching `v*.*.*` (e.g. v0.1.0).
+#           Or run manually via the Actions tab (workflow_dispatch).
+#
+# Auth:     reads the CARGO_REGISTRY_TOKEN repository secret. Generate
+#           a scoped token at https://crates.io/me with publish-new and
+#           publish-update permission for the three crate names, then
+#           add it under Settings → Secrets and variables → Actions.
+#           (You can switch to crates.io trusted publishing after the
+#           first release; see https://crates.io/docs/trusted-publishing.)
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run cargo publish --dry-run instead of publishing"
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  preflight:
+    name: preflight (fmt + clippy + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --all-targets
+
+  publish:
+    name: publish to crates.io
+    needs: preflight
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify tag matches workspace version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/v}"
+          MANIFEST="$(grep -m1 -E '^version' Cargo.toml | cut -d'"' -f2)"
+          echo "Tag version:       $TAG"
+          echo "Manifest version:  $MANIFEST"
+          if [ "$TAG" != "$MANIFEST" ]; then
+            echo "::error::Tag v$TAG does not match workspace version $MANIFEST"
+            exit 1
+          fi
+
+      - name: cargo publish (dry-run)
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+        run: |
+          # Full dry-run for the leaf crate (it has no internal deps).
+          cargo publish --dry-run -p shuflr-wire
+          # Downstream crates resolve shuflr-wire / shuflr from
+          # crates.io; until those are out, only validate the manifest
+          # via `cargo package --list`.
+          cargo package --list -p shuflr
+          cargo package --list -p shuflr-cli
+
+      - name: cargo publish shuflr-wire
+        if: github.event_name == 'push' || !inputs.dry_run
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p shuflr-wire
+
+      - name: Wait for crates.io to index shuflr-wire
+        if: github.event_name == 'push' || !inputs.dry_run
+        run: sleep 30
+
+      - name: cargo publish shuflr
+        if: github.event_name == 'push' || !inputs.dry_run
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p shuflr
+
+      - name: Wait for crates.io to index shuflr
+        if: github.event_name == 'push' || !inputs.dry_run
+        run: sleep 30
+
+      - name: cargo publish shuflr-cli
+        if: github.event_name == 'push' || !inputs.dry_run
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p shuflr-cli

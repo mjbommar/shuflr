@@ -1,0 +1,133 @@
+name: release-binaries
+
+# Builds the `shuflr` CLI binary for the standard platform matrix and
+# attaches the archives to a GitHub Release. Defaults include the
+# `serve` and `parquet` features so the released binary can run a
+# production server out of the box.
+#
+# Trigger:  push a tag matching `v*.*.*`. Or run manually via the
+#           Actions tab (workflow_dispatch) — manual runs build the
+#           artifacts but skip the release-attach step.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  BIN_FEATURES: "serve,parquet,zstd,gzip,bzip2,xz"
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cross: false
+            archive: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross: true
+            archive: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            cross: false
+            archive: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            cross: false
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cross: false
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross (Linux aarch64)
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
+      - name: Build (native)
+        if: '!matrix.cross'
+        shell: bash
+        run: |
+          cargo build --release --locked \
+            -p shuflr-cli \
+            --features "${BIN_FEATURES}" \
+            --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        shell: bash
+        run: |
+          cross build --release --locked \
+            -p shuflr-cli \
+            --features "${BIN_FEATURES}" \
+            --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -m1 -E '^version' Cargo.toml | cut -d'"' -f2)"
+          NAME="shuflr-${VERSION}-${{ matrix.target }}"
+          STAGE="dist/${NAME}"
+          mkdir -p "${STAGE}"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            cp "target/${{ matrix.target }}/release/shuflr.exe" "${STAGE}/"
+          else
+            cp "target/${{ matrix.target }}/release/shuflr" "${STAGE}/"
+          fi
+          cp README.md LICENSE-MIT LICENSE-APACHE "${STAGE}/"
+          cd dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a "${NAME}.zip" "${NAME}" >/dev/null
+          else
+            tar czf "${NAME}.tar.gz" "${NAME}"
+          fi
+          ls -lh
+          echo "asset=dist/${NAME}.${{ matrix.archive }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shuflr-${{ matrix.target }}
+          path: ${{ steps.stage.outputs.asset }}
+          if-no-files-found: error
+
+  release:
+    name: attach to GitHub Release
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List artifacts
+        run: ls -lh dist/
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
