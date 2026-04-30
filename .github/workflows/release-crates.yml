@@ -78,11 +78,23 @@ jobs:
           cargo package --list -p shuflr
           cargo package --list -p shuflr-cli
 
+      # Each publish is wrapped to treat "already exists / already
+      # uploaded" as a no-op success. This keeps tag re-pushes
+      # (e.g. when a sibling workflow needed re-running) from
+      # turning the release-crates run red after the version is
+      # already on the registry.
       - name: cargo publish shuflr-wire
         if: github.event_name == 'push' || !inputs.dry_run
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p shuflr-wire
+        run: |
+          set +e
+          out=$(cargo publish -p shuflr-wire 2>&1)
+          ec=$?
+          echo "$out"
+          if [ $ec -ne 0 ] && ! echo "$out" | grep -qE 'already (exists|uploaded)'; then
+            exit $ec
+          fi
 
       - name: Wait for crates.io to index shuflr-wire
         if: github.event_name == 'push' || !inputs.dry_run
@@ -92,7 +104,14 @@ jobs:
         if: github.event_name == 'push' || !inputs.dry_run
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p shuflr
+        run: |
+          set +e
+          out=$(cargo publish -p shuflr 2>&1)
+          ec=$?
+          echo "$out"
+          if [ $ec -ne 0 ] && ! echo "$out" | grep -qE 'already (exists|uploaded)'; then
+            exit $ec
+          fi
 
       - name: Wait for crates.io to index shuflr
         if: github.event_name == 'push' || !inputs.dry_run
@@ -102,4 +121,11 @@ jobs:
         if: github.event_name == 'push' || !inputs.dry_run
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p shuflr-cli
+        run: |
+          set +e
+          out=$(cargo publish -p shuflr-cli 2>&1)
+          ec=$?
+          echo "$out"
+          if [ $ec -ne 0 ] && ! echo "$out" | grep -qE 'already (exists|uploaded)'; then
+            exit $ec
+          fi

@@ -49,9 +49,12 @@ jobs:
             target: aarch64-unknown-linux-gnu
             maturin_target: aarch64
             manylinux: "2_28"
-          - os: macos-13
-            target: x86_64-apple-darwin
-            maturin_target: x86_64
+          # macOS x86_64 dropped: GitHub is phasing out macos-13
+          # Intel runners (queue times of 30+ minutes during peak),
+          # and Apple stopped selling Intel Macs in 2023. Apple
+          # Silicon users get the native arm64 wheel; Intel Mac
+          # users can fall back to `pip install shuflr-client`
+          # building from sdist.
           - os: macos-14
             target: aarch64-apple-darwin
             maturin_target: aarch64

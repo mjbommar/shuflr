@@ -36,10 +36,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
             cross: true
             archive: tar.gz
-          - os: macos-13
-            target: x86_64-apple-darwin
-            cross: false
-            archive: tar.gz
+          # macOS x86_64 dropped — see comment in release-pypi.yml.
           - os: macos-14
             target: aarch64-apple-darwin
             cross: false
