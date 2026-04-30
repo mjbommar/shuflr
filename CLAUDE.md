@@ -83,23 +83,20 @@ Three crates. `shuflr` holds all engine code; `shuflr-cli` is the binary; `shufl
 
 ## Current status
 
-Through PR-28. Highlights since PR-14: PR-15 (visible WARN on silently-dropped oversized records), PR-16 (wire standalone `verify`), PR-17 (`shuflr man`), PR-18 (--threads=0 → physical cores on convert), PR-19 (JS + per-frame entropy in `analyze`), PR-20 (PyTorch IterableDataset example), PR-21 (entropy filter on convert), PR-22 (`index-perm` on seekable-zstd, no plain-file scratch), PR-23 (`.shuflr-idx-zst` sidecar — 1595× cache-hot speedup), PR-24 (`analyze --json`), PR-25 (progress bar during the zstd record-index cold build), PR-26 (parallel cold-cache record-index build — 4.13× speedup, 127 s → 32 s), PR-27 (parallel emit for `--shuffle=index-perm` — 2.39× at 10k sample), PR-28 (parallel emit for `--shuffle=chunk-shuffled` — 1.77× at 30k sample, byte-identical).
+**Production-tested.** A single `shuflr serve` instance has run for 4 days 14 hours under heavy real-world workload — zero crashes, zero data corruption, zero observed errors. ~2.4 TB streamed from 178 GB on-disk source data (~6 MB/s avg, >50 MB/s peak) at 0.7 % CPU; bottleneck is disk I/O, not compute. Powered 16+ LLM training runs across ~62 dataset shards, sustaining ~150 concurrent TCP connections (training + eval workers, one keepalive socket per source stream). The whole architecture: throw seekable-zstd files at the binary, point Python at HTTP URLs.
 
-**179 tests green.** Both hot-path emit modes (`chunk-shuffled` and `index-perm` on seekable-zstd) now have prefetch-pipeline parallel variants. `--emit-threads=N --emit-prefetch=K` is shared across modes; default stays `--emit-threads=1` (no behavior change without opt-in).
+Pushed to `github.com/mjbommar/shuflr`. Not yet on crates.io / PyPI — workspace version is `0.0.0` as a pre-release marker.
 
-Through **PR-34b**: HTTP transport with rustls TLS 1.3 + bearer/mTLS auth (PR-30/31), `shuflr-wire/1` codec crate (PR-32), wire transport inside `serve` speaking TCP + optional TLS with `plain-batch` mode for all 5 shuffle modes (PR-33), and the Python client (`shuflr-client`) speaking both HTTP and `shuflr://` wire (PR-34a/b). `shuflr serve --wire 127.0.0.1:9443 --http 127.0.0.1:9000 ...` runs both listeners simultaneously under one Ctrl-C.
+PR history through PR-37 (parquet + HF Hub input). Both hot-path emit modes (`chunk-shuffled` and `index-perm` on seekable-zstd) have prefetch-pipeline parallel variants — `--emit-threads=N --emit-prefetch=K` shared across modes, default stays `--emit-threads=1` (no behavior change without opt-in). HTTP transport (rustls TLS 1.3 + bearer/mTLS auth) and `shuflr-wire/1` (raw-frame passthrough — ~3.6× wire savings on chunk-shuffled) both ship; `shuflr serve --http :9000 --wire :9443 ...` runs both listeners under one Ctrl-C.
 
-**PR-37 (2026-04-24) — parquet + HF Hub input for `shuflr convert`** behind the `parquet` cargo feature. Graduates `Parquet / Arrow IPC input` from the "v2" row of 002 §Deferred to shipped v1.x. New input forms:
-- `shuflr convert hf://<namespace>/<repo>[@revision] -o out.jsonl.zst` — fetches parquet shards from HF Hub lazily (one at a time; `--limit N` does not over-download).
-- `shuflr convert /path/to/file.parquet -o ...` — single local parquet.
-- `shuflr convert /path/to/dir/ -o ...` — directory of parquet shards, read in sorted order.
-- `--parquet-project col1,col2,...` — column projection at the parquet reader level (unread columns never decoded; ~50% decode savings on wide data).
-Parquet rows serialize to JSONL bytes in-memory and pass through the existing SamplingReader + entropy filter + seekable-zstd writer. Handles primitive types + `List<*>` arrays (for pre-tokenized MLM). Feature is additive — builds without `--features parquet` see zero cost.
+Parquet input (PR-37, `--features parquet`) handles single files, shard directories, and `hf://user/repo[@rev]` lazily (one shard at a time). Column projection at the parquet reader level — unread columns never decoded. Primitives + `List<*>` arrays (for pre-tokenized MLM corpora).
 
-Remaining 005 PRs: **33a** credit-based flow control — **33b** raw-frame passthrough for chunk-shuffled (~6× wire savings) — **33c** zstd-batch compression — **33d** UDS listener — **34c** `shuflr-client` speaks `shuflrs://` (TLS) — **35** gRPC — **36** observability.
+234+ tests green at the default feature set; `serve` and `parquet` features each add their own. `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean (any drift is a publish-blocker).
+
+Remaining 005 PRs: **33a** credit-based flow control — **33c** zstd-batch compression — **33d** UDS listener — **34c** `shuflr-client` speaks `shuflrs://` (TLS) — **35** gRPC — **36** observability.
 
 Other known follow-ups: parallel-pread reader for convert, SIGBUS handler + `--require-immutable`, consistent `--log-level` across all subcommands.
 
 ## Upstream
 
-Destined for `github.com/mjbommar/shuflr`. Local-only until pushed.
+Source of truth: `github.com/mjbommar/shuflr`. Package registries (crates.io for `shuflr-wire`/`shuflr`/`shuflr-cli`, PyPI for `shuflr-client`) pending a 0.1.0 cut.
