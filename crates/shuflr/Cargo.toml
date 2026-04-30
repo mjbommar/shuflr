@@ -8,6 +8,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://docs.rs/shuflr"
+readme = "README.md"
+keywords = ["jsonl", "shuffle", "streaming", "training-data", "zstd"]
+categories = ["command-line-utilities", "data-structures", "filesystem"]
 
 [lints]
 workspace = true
@@ -92,7 +96,7 @@ rustls = { version = "0.23", optional = true, default-features = false, features
 tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["tls12", "ring"] }
 rustls-pemfile = { version = "2", optional = true }
 subtle = { version = "2", optional = true, default-features = false }
-shuflr-wire = { path = "../shuflr-wire", optional = true }
+shuflr-wire = { path = "../shuflr-wire", version = "0.1", optional = true }
 serde = { version = "1", optional = true, features = ["derive"] }
 serde_json = { version = "1", optional = true }
 metrics = { version = "0.23", optional = true }

@@ -8,6 +8,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
+# Distributed as a Python wheel on PyPI; the Rust crate is not
+# published to crates.io.
+publish = false
 
 [lints]
 workspace = true
@@ -30,7 +34,7 @@ url = "2"
 thiserror = "2"
 # Binary wire transport (005 §2.2). Pulls in only codec + thiserror
 # + xxh3 — no tokio, no TLS — so the wheel stays lean.
-shuflr-wire = { path = "../shuflr-wire" }
+shuflr-wire = { path = "../shuflr-wire", version = "0.1" }
 # JSON (de)serialization for OpenStream / StreamOpened payloads.
 # Lives inside the codec's opaque bytes; server uses the same crate.
 serde = { version = "1", features = ["derive"] }

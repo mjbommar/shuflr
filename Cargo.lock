@@ -3955,7 +3955,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "shuflr"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4006,7 +4006,7 @@ dependencies = [
 
 [[package]]
 name = "shuflr-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -4033,7 +4033,7 @@ dependencies = [
 
 [[package]]
 name = "shuflr-client"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "memchr",
  "pyo3",
@@ -4054,7 +4054,7 @@ dependencies = [
 
 [[package]]
 name = "shuflr-wire"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "proptest",
  "thiserror 2.0.18",

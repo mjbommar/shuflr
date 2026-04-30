@@ -7,6 +7,11 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/shuflr-cli"
+readme = "README.md"
+keywords = ["jsonl", "shuffle", "streaming", "training-data", "cli"]
+categories = ["command-line-utilities", "data-structures"]
 
 [lints]
 workspace = true
@@ -36,7 +41,7 @@ serve = ["shuflr/serve", "dep:tokio"]
 full = ["serve", "grpc", "prom", "otlp", "uring", "zstd", "gzip", "bzip2", "xz", "s3", "gcs", "sandbox", "parquet"]
 
 [dependencies]
-shuflr = { path = "../shuflr" }
+shuflr = { path = "../shuflr", version = "0.1" }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env", "wrap_help", "color"] }
 clap_complete = "4"
@@ -62,7 +67,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "tls12
 rcgen = "0.13"
 # Used by the `serve_wire` integration tests to drive the wire codec
 # over tokio TCP; the main CLI brings tokio in via --features serve.
-shuflr-wire = { path = "../shuflr-wire" }
+shuflr-wire = { path = "../shuflr-wire", version = "0.1" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros"] }
 # Raw-frame replay in tests: decompress zstd, reseed ChaCha20, Fisher-
 # Yates — same pieces the Python client uses, checked independently

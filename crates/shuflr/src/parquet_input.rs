@@ -66,17 +66,13 @@ impl HfShardSource {
             .build()
             .map_err(|e| Error::Input(format!("hf-hub: build api failed: {e}")))?;
         let repo_handle = match revision {
-            Some(rev) => api.repo(Repo::with_revision(
-                repo_id.clone(),
-                RepoType::Dataset,
-                rev,
-            )),
+            Some(rev) => api.repo(Repo::with_revision(repo_id.clone(), RepoType::Dataset, rev)),
             None => api.dataset(repo_id.clone()),
         };
 
-        let info = repo_handle.info().map_err(|e| {
-            Error::Input(format!("hf-hub: fetch info for {repo_id:?} failed: {e}"))
-        })?;
+        let info = repo_handle
+            .info()
+            .map_err(|e| Error::Input(format!("hf-hub: fetch info for {repo_id:?} failed: {e}")))?;
         let mut shards: Vec<String> = info
             .siblings
             .into_iter()
@@ -226,8 +222,7 @@ impl ParquetJsonlReader {
             let schema = builder.parquet_schema();
             let mut indices = Vec::new();
             for name in cols {
-                let idx = (0..schema.num_columns())
-                    .find(|i| schema.column(*i).name() == name);
+                let idx = (0..schema.num_columns()).find(|i| schema.column(*i).name() == name);
                 match idx {
                     Some(i) => indices.push(i),
                     None => {
@@ -350,30 +345,52 @@ fn serialize_row(batch: &RecordBatch, row: usize) -> Result<String> {
         } else {
             match field.data_type() {
                 DataType::Utf8 => Value::String(col.as_string::<i32>().value(row).to_string()),
-                DataType::LargeUtf8 => {
-                    Value::String(col.as_string::<i64>().value(row).to_string())
-                }
-                DataType::Int8 => Value::from(col.as_primitive::<arrow_array::types::Int8Type>().value(row)),
-                DataType::Int16 => Value::from(col.as_primitive::<arrow_array::types::Int16Type>().value(row)),
-                DataType::Int32 => Value::from(col.as_primitive::<arrow_array::types::Int32Type>().value(row)),
-                DataType::Int64 => Value::from(col.as_primitive::<arrow_array::types::Int64Type>().value(row)),
-                DataType::UInt8 => Value::from(col.as_primitive::<arrow_array::types::UInt8Type>().value(row)),
-                DataType::UInt16 => Value::from(col.as_primitive::<arrow_array::types::UInt16Type>().value(row)),
-                DataType::UInt32 => Value::from(col.as_primitive::<arrow_array::types::UInt32Type>().value(row)),
-                DataType::UInt64 => Value::from(col.as_primitive::<arrow_array::types::UInt64Type>().value(row)),
+                DataType::LargeUtf8 => Value::String(col.as_string::<i64>().value(row).to_string()),
+                DataType::Int8 => Value::from(
+                    col.as_primitive::<arrow_array::types::Int8Type>()
+                        .value(row),
+                ),
+                DataType::Int16 => Value::from(
+                    col.as_primitive::<arrow_array::types::Int16Type>()
+                        .value(row),
+                ),
+                DataType::Int32 => Value::from(
+                    col.as_primitive::<arrow_array::types::Int32Type>()
+                        .value(row),
+                ),
+                DataType::Int64 => Value::from(
+                    col.as_primitive::<arrow_array::types::Int64Type>()
+                        .value(row),
+                ),
+                DataType::UInt8 => Value::from(
+                    col.as_primitive::<arrow_array::types::UInt8Type>()
+                        .value(row),
+                ),
+                DataType::UInt16 => Value::from(
+                    col.as_primitive::<arrow_array::types::UInt16Type>()
+                        .value(row),
+                ),
+                DataType::UInt32 => Value::from(
+                    col.as_primitive::<arrow_array::types::UInt32Type>()
+                        .value(row),
+                ),
+                DataType::UInt64 => Value::from(
+                    col.as_primitive::<arrow_array::types::UInt64Type>()
+                        .value(row),
+                ),
                 DataType::Float32 => serde_json::Number::from_f64(
-                    col.as_primitive::<arrow_array::types::Float32Type>().value(row) as f64,
+                    col.as_primitive::<arrow_array::types::Float32Type>()
+                        .value(row) as f64,
                 )
                 .map(Value::Number)
                 .unwrap_or(Value::Null),
                 DataType::Float64 => serde_json::Number::from_f64(
-                    col.as_primitive::<arrow_array::types::Float64Type>().value(row),
+                    col.as_primitive::<arrow_array::types::Float64Type>()
+                        .value(row),
                 )
                 .map(Value::Number)
                 .unwrap_or(Value::Null),
-                DataType::Boolean => {
-                    Value::Bool(col.as_boolean().value(row))
-                }
+                DataType::Boolean => Value::Bool(col.as_boolean().value(row)),
                 DataType::Binary => {
                     // Emit as base64 string so the JSON is legible. Rare in HF text datasets.
                     let bytes = col.as_binary::<i32>().value(row);
@@ -387,7 +404,9 @@ fn serialize_row(batch: &RecordBatch, row: usize) -> Result<String> {
                     if let Some(la) = list_arr {
                         let inner = la.value(row);
                         Value::Array(arrow_array_to_json_values(&inner))
-                    } else if let Some(la) = col.as_any().downcast_ref::<arrow_array::LargeListArray>() {
+                    } else if let Some(la) =
+                        col.as_any().downcast_ref::<arrow_array::LargeListArray>()
+                    {
                         let inner = la.value(row);
                         Value::Array(arrow_array_to_json_values(&inner))
                     } else {
@@ -426,21 +445,42 @@ fn arrow_array_to_json_values(arr: &dyn arrow_array::Array) -> Vec<Value> {
             continue;
         }
         let v = match arr.data_type() {
-            DataType::Int8 => Value::from(arr.as_primitive::<arrow_array::types::Int8Type>().value(i)),
-            DataType::Int16 => Value::from(arr.as_primitive::<arrow_array::types::Int16Type>().value(i)),
-            DataType::Int32 => Value::from(arr.as_primitive::<arrow_array::types::Int32Type>().value(i)),
-            DataType::Int64 => Value::from(arr.as_primitive::<arrow_array::types::Int64Type>().value(i)),
-            DataType::UInt8 => Value::from(arr.as_primitive::<arrow_array::types::UInt8Type>().value(i)),
-            DataType::UInt16 => Value::from(arr.as_primitive::<arrow_array::types::UInt16Type>().value(i)),
-            DataType::UInt32 => Value::from(arr.as_primitive::<arrow_array::types::UInt32Type>().value(i)),
-            DataType::UInt64 => Value::from(arr.as_primitive::<arrow_array::types::UInt64Type>().value(i)),
+            DataType::Int8 => {
+                Value::from(arr.as_primitive::<arrow_array::types::Int8Type>().value(i))
+            }
+            DataType::Int16 => {
+                Value::from(arr.as_primitive::<arrow_array::types::Int16Type>().value(i))
+            }
+            DataType::Int32 => {
+                Value::from(arr.as_primitive::<arrow_array::types::Int32Type>().value(i))
+            }
+            DataType::Int64 => {
+                Value::from(arr.as_primitive::<arrow_array::types::Int64Type>().value(i))
+            }
+            DataType::UInt8 => {
+                Value::from(arr.as_primitive::<arrow_array::types::UInt8Type>().value(i))
+            }
+            DataType::UInt16 => Value::from(
+                arr.as_primitive::<arrow_array::types::UInt16Type>()
+                    .value(i),
+            ),
+            DataType::UInt32 => Value::from(
+                arr.as_primitive::<arrow_array::types::UInt32Type>()
+                    .value(i),
+            ),
+            DataType::UInt64 => Value::from(
+                arr.as_primitive::<arrow_array::types::UInt64Type>()
+                    .value(i),
+            ),
             DataType::Float32 => serde_json::Number::from_f64(
-                arr.as_primitive::<arrow_array::types::Float32Type>().value(i) as f64,
+                arr.as_primitive::<arrow_array::types::Float32Type>()
+                    .value(i) as f64,
             )
             .map(Value::Number)
             .unwrap_or(Value::Null),
             DataType::Float64 => serde_json::Number::from_f64(
-                arr.as_primitive::<arrow_array::types::Float64Type>().value(i),
+                arr.as_primitive::<arrow_array::types::Float64Type>()
+                    .value(i),
             )
             .map(Value::Number)
             .unwrap_or(Value::Null),
@@ -482,11 +522,7 @@ pub fn looks_like_parquet_input(path: &Path) -> bool {
         if let Ok(mut entries) = std::fs::read_dir(path) {
             return entries.any(|e| {
                 e.ok()
-                    .map(|e| {
-                        e.path()
-                            .extension()
-                            .is_some_and(|ext| ext == "parquet")
-                    })
+                    .map(|e| e.path().extension().is_some_and(|ext| ext == "parquet"))
                     .unwrap_or(false)
             });
         }
@@ -518,7 +554,10 @@ mod tests {
     fn parses_valid_hf_urls() {
         assert_eq!(
             parse_hf_url("hf://alea-institute/kl3m-data-sample-006-medium"),
-            Some(("alea-institute/kl3m-data-sample-006-medium".to_string(), None))
+            Some((
+                "alea-institute/kl3m-data-sample-006-medium".to_string(),
+                None
+            ))
         );
         assert_eq!(
             parse_hf_url("hf://ns/repo@v1"),
@@ -547,7 +586,12 @@ mod tests {
     fn list_parquet_shards_sorted() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
-        for name in ["train-00002.parquet", "train-00000.parquet", "other.txt", "train-00001.parquet"] {
+        for name in [
+            "train-00002.parquet",
+            "train-00000.parquet",
+            "other.txt",
+            "train-00001.parquet",
+        ] {
             let mut f = std::fs::File::create(dir.path().join(name)).unwrap();
             f.write_all(b"x").unwrap();
         }

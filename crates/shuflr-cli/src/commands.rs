@@ -906,9 +906,7 @@ fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
         let s = in_path.to_string_lossy();
         if shuflr::parquet_input::looks_like_parquet_input(in_path) {
             let project = args.parquet_project.clone();
-            let reader = if let Some((repo, _rev)) =
-                shuflr::parquet_input::parse_hf_url(&s)
-            {
+            let reader = if let Some((repo, _rev)) = shuflr::parquet_input::parse_hf_url(&s) {
                 tracing::info!(repo = %repo, "parquet input via HF Hub (lazy shard fetch)");
                 let hf = shuflr::parquet_input::HfShardSource::open(&s)?;
                 shuflr::parquet_input::ParquetJsonlReader::from_hf(hf, project)
@@ -928,10 +926,7 @@ fn convert_inner(args: cli::ConvertArgs) -> shuflr::Result<()> {
                 shuflr::parquet_input::ParquetJsonlReader::new(shards, project)
             } else {
                 tracing::info!(path = %in_path.display(), "parquet input (local file)");
-                shuflr::parquet_input::ParquetJsonlReader::new(
-                    vec![in_path.clone()],
-                    project,
-                )
+                shuflr::parquet_input::ParquetJsonlReader::new(vec![in_path.clone()], project)
             };
             Some(Box::new(reader))
         } else {
